@@ -337,6 +337,11 @@ export default function FuturesTracker() {
   const [extChangeMap, setExtChangeMap] = useState({}); // symbol -> {"120":pct, "240":pct, "480":pct, "720":pct}
   const [extChangeBulkStatus, setExtChangeBulkStatus] = useState("idle"); // idle | loading | done | blocked
   const [extChangeBulkDone, setExtChangeBulkDone] = useState(0);
+  // TA screener: symbol -> {trend, trendStrength, momentum, support,
+  // resistance, reversal, ...} from fetchTAForSymbol.
+  const [taMap, setTaMap] = useState({});
+  const [taBulkStatus, setTaBulkStatus] = useState("idle"); // idle | loading | done | blocked
+  const [taBulkDone, setTaBulkDone] = useState(0);
   const tradeSignRef = useRef({});
   // Edge-triggered "is this rule currently passing?" state, keyed by rule
   // key (+ symbol for price rules). Replaces cooldown-timer firing: a
@@ -396,6 +401,8 @@ export default function FuturesTracker() {
         });
         setExtChangeMap(map);
       }
+      const taCache = await safeStorageGet("ta-cache");
+      if (taCache) setTaMap(taCache);
       storageLoaded.current = true;
     })();
   }, []);
@@ -459,6 +466,60 @@ export default function FuturesTracker() {
       const waitMs = Math.max(5000, binanceGuard.blockedUntil - Date.now());
       setTimeout(() => {
         setAthAtlBulkStatus("idle");
+      }, waitMs);
+    }
+  };
+
+  const bulkTaRunning = useRef(false);
+  const startTaBulk = async () => {
+    if (bulkTaRunning.current || rows.length === 0) return;
+    if (Date.now() < binanceGuard.blockedUntil) {
+      setTaBulkStatus("blocked");
+      return;
+    }
+    bulkTaRunning.current = true;
+    setTaBulkStatus("loading");
+    setTaBulkDone(0);
+    const symbols = [...rows].sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume)).map((r) => r.symbol);
+    const cacheMap = { ...((await safeStorageGet("ta-cache")) || {}) };
+    const chunkSize = 3;
+    const weightPerSymbol = 5; // single 150-candle klines request
+    let done = 0;
+    let blocked = false;
+    for (let i = 0; i < symbols.length && !blocked; i += chunkSize) {
+      const chunk = symbols.slice(i, i + chunkSize);
+      // eslint-disable-next-line no-await-in-loop
+      await waitForWeightHeadroom(chunk.length * weightPerSymbol * 2);
+      await Promise.allSettled(
+        chunk.map(async (sym) => {
+          try {
+            const result = await fetchTAForSymbol(sym);
+            cacheMap[sym] = result;
+            setTaMap((m) => ({ ...m, [sym]: result }));
+          } catch (e) {
+            if (/HTTP (418|429)/.test(e.message || "")) blocked = true;
+            /* otherwise skip this symbol, keep going */
+          } finally {
+            done += 1;
+            setTaBulkDone(done);
+          }
+        })
+      );
+      // eslint-disable-next-line no-await-in-loop
+      await safeStorageSet("ta-cache", cacheMap);
+      if (blocked || Date.now() < binanceGuard.blockedUntil) {
+        blocked = true;
+        break;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    setTaBulkStatus(blocked ? "blocked" : "done");
+    bulkTaRunning.current = false;
+    if (blocked) {
+      const waitMs = Math.max(5000, binanceGuard.blockedUntil - Date.now());
+      setTimeout(() => {
+        setTaBulkStatus("idle");
       }, waitMs);
     }
   };
@@ -1377,7 +1438,7 @@ export default function FuturesTracker() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${C.border}` }}>
-          {["market", "analyze", "alerts"].map((t) => (
+          {["market", "analyze", "screener", "alerts"].map((t) => (
             <div
               key={t}
               className="ft-tab"
@@ -1563,6 +1624,17 @@ export default function FuturesTracker() {
             setAnalyzeSymbol={setAnalyzeSymbol}
             savedTrades={savedTrades}
             setSavedTrades={setSavedTrades}
+            logos={coinLogos}
+          />
+        )}
+
+        {tab === "screener" && (
+          <ScreenerPanel
+            rows={rows}
+            taMap={taMap}
+            taBulkStatus={taBulkStatus}
+            taBulkDone={taBulkDone}
+            startTaBulk={startTaBulk}
             logos={coinLogos}
           />
         )}
@@ -2001,6 +2073,165 @@ async function fetchExtChanges(symbol) {
     if (idx >= 0) out[min] = ((last - closes[idx]) / closes[idx]) * 100;
   });
   return out;
+}
+
+// ---- TA screener: pure indicator math over an array of closes/highs/lows ----
+// All take plain arrays (oldest first) and return arrays/numbers aligned the
+// same way standard charting libraries do, so the logic is easy to sanity
+// check against any other TA tool.
+
+function emaSeries(values, period) {
+  if (!values || values.length === 0) return [];
+  const k = 2 / (period + 1);
+  const out = [values[0]];
+  for (let i = 1; i < values.length; i++) {
+    out.push(values[i] * k + out[i - 1] * (1 - k));
+  }
+  return out;
+}
+
+function rsiValue(closes, period = 14) {
+  if (!closes || closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+// Wilder's ADX(14) — trend-strength regardless of direction. Computed over
+// the full series (not just the tail) since +DI/-DI/DX need Wilder-smoothed
+// running sums, then the ADX itself is a smoothed average of DX.
+function adxValue(highs, lows, closes, period = 14) {
+  const n = highs.length;
+  if (n < period * 2) return null;
+  const trs = [], plusDMs = [], minusDMs = [];
+  for (let i = 1; i < n; i++) {
+    const upMove = highs[i] - highs[i - 1];
+    const downMove = lows[i - 1] - lows[i];
+    plusDMs.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDMs.push(downMove > upMove && downMove > 0 ? downMove : 0);
+    trs.push(Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i] - closes[i - 1])
+    ));
+  }
+  const wilderSmooth = (arr) => {
+    const out = [];
+    let sum = arr.slice(0, period).reduce((a, b) => a + b, 0);
+    out.push(sum);
+    for (let i = period; i < arr.length; i++) {
+      sum = sum - sum / period + arr[i];
+      out.push(sum);
+    }
+    return out;
+  };
+  const trSm = wilderSmooth(trs);
+  const plusSm = wilderSmooth(plusDMs);
+  const minusSm = wilderSmooth(minusDMs);
+  const dxs = [];
+  for (let i = 0; i < trSm.length; i++) {
+    if (trSm[i] === 0) continue;
+    const plusDI = (100 * plusSm[i]) / trSm[i];
+    const minusDI = (100 * minusSm[i]) / trSm[i];
+    const sum = plusDI + minusDI;
+    dxs.push(sum === 0 ? 0 : (100 * Math.abs(plusDI - minusDI)) / sum);
+  }
+  if (dxs.length < period) return dxs.length ? dxs[dxs.length - 1] : null;
+  const firstAdx = dxs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  let adx = firstAdx;
+  for (let i = period; i < dxs.length; i++) {
+    adx = (adx * (period - 1) + dxs[i]) / period;
+  }
+  return adx;
+}
+
+// Nearest recent swing high / low over a lookback window — a simple, robust
+// stand-in for "possible support/resistance" that works the same way across
+// every pair without needing per-symbol tuning.
+function swingLevels(highs, lows, lookback = 60) {
+  const h = highs.slice(-lookback);
+  const l = lows.slice(-lookback);
+  return { resistance: h.length ? Math.max(...h) : null, support: l.length ? Math.min(...l) : null };
+}
+
+// Pulls 4h candles (plenty of history in one weight-5 request) and derives
+// the full screener row for one symbol: trend direction, trend strength,
+// momentum, nearby support/resistance, and a simple reversal flag.
+async function fetchTAForSymbol(symbol) {
+  const res = await fapiFetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=4h&limit=150`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  if (!Array.isArray(data) || data.length < 60) throw new Error("not enough history");
+
+  const highs = data.map((k) => parseFloat(k[2]));
+  const lows = data.map((k) => parseFloat(k[3]));
+  const closes = data.map((k) => parseFloat(k[4]));
+  const last = closes[closes.length - 1];
+
+  const ema20 = emaSeries(closes, 20);
+  const ema50 = emaSeries(closes, 50);
+  const lastEma20 = ema20[ema20.length - 1];
+  const lastEma50 = ema50[ema50.length - 1];
+  const emaGapPct = ((lastEma20 - lastEma50) / lastEma50) * 100;
+
+  let trend = "Sideways";
+  if (last > lastEma20 && lastEma20 > lastEma50 && emaGapPct > 0.15) trend = "Up";
+  else if (last < lastEma20 && lastEma20 < lastEma50 && emaGapPct < -0.15) trend = "Down";
+
+  const adx = adxValue(highs, lows, closes, 14);
+  let trendStrength = "Weak";
+  if (adx !== null) {
+    if (adx >= 35) trendStrength = "Very strong";
+    else if (adx >= 25) trendStrength = "Strong";
+    else if (adx >= 15) trendStrength = "Moderate";
+  }
+
+  const rsi = rsiValue(closes, 14);
+  let momentum = "Neutral";
+  if (rsi !== null) {
+    if (rsi >= 70) momentum = "Overbought";
+    else if (rsi >= 55) momentum = "Bullish";
+    else if (rsi <= 30) momentum = "Oversold";
+    else if (rsi <= 45) momentum = "Bearish";
+  }
+
+  const { support, resistance } = swingLevels(highs, lows, 60);
+  const nearRes = resistance ? ((resistance - last) / last) * 100 : null; // % above price
+  const nearSup = support ? ((last - support) / last) * 100 : null; // % below price
+
+  // Reversal: RSI at an extreme while price sits close to the level that
+  // would make that extreme meaningful (overbought near resistance in an
+  // uptrend, oversold near support in a downtrend).
+  let reversal = "None";
+  if (rsi !== null) {
+    if (rsi >= 70 && nearRes !== null && nearRes <= 2) reversal = "Possible top";
+    else if (rsi <= 30 && nearSup !== null && nearSup <= 2) reversal = "Possible bottom";
+    else if (rsi >= 75) reversal = "Overextended up";
+    else if (rsi <= 25) reversal = "Overextended down";
+  }
+
+  return {
+    trend,
+    trendStrength,
+    adx,
+    momentum,
+    rsi,
+    support,
+    resistance,
+    nearSupportPct: nearSup,
+    nearResistancePct: nearRes,
+    reversal,
+    price: last,
+    updatedAt: Date.now(),
+  };
 }
 
 async function fetchAnalysisExtras(symbol) {
@@ -2948,6 +3179,264 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
 }
 
 
+
+// Color-coded badge chip used throughout the screener table (trend,
+// strength, momentum, reversal) — keeps the "pro screener" look consistent
+// without repeating the same inline style object everywhere.
+function TaBadge({ text, tone }) {
+  const palette = {
+    bull: { bg: C.gainBg, fg: C.gain, border: C.gain },
+    bear: { bg: C.lossBg, fg: C.loss, border: C.loss },
+    warn: { bg: "rgba(232,163,61,0.12)", fg: C.amber, border: C.amber },
+    neutral: { bg: C.panelAlt, fg: C.textMuted, border: C.border },
+  }[tone] || { bg: C.panelAlt, fg: C.textMuted, border: C.border };
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        padding: "3px 8px",
+        borderRadius: 6,
+        fontSize: 11,
+        fontWeight: 700,
+        background: palette.bg,
+        color: palette.fg,
+        border: `1px solid ${palette.border}`,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {text}
+    </span>
+  );
+}
+
+function trendTone(trend) {
+  if (trend === "Up") return "bull";
+  if (trend === "Down") return "bear";
+  return "neutral";
+}
+function strengthTone(s) {
+  if (s === "Very strong" || s === "Strong") return "warn";
+  if (s === "Moderate") return "neutral";
+  return "neutral";
+}
+function momentumTone(m) {
+  if (m === "Overbought" || m === "Bullish") return "bull";
+  if (m === "Oversold" || m === "Bearish") return "bear";
+  return "neutral";
+}
+function reversalTone(r) {
+  if (r === "Possible bottom") return "bull";
+  if (r === "Possible top") return "bear";
+  if (r === "Overextended up" || r === "Overextended down") return "warn";
+  return "neutral";
+}
+
+function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, logos }) {
+  const [query, setQuery] = useState("");
+  const [trendFilter, setTrendFilter] = useState("all"); // all | Up | Down | Sideways
+  const [sortKey, setSortKey] = useState("volume"); // volume | rsi | adx
+  const scanned = Object.keys(taMap).length;
+
+  const sorted = useMemo(() => {
+    let list = rows.filter((r) => r.symbol.toLowerCase().includes(query.trim().toLowerCase()));
+    if (trendFilter !== "all") {
+      list = list.filter((r) => taMap[r.symbol]?.trend === trendFilter);
+    }
+    list = [...list];
+    if (sortKey === "rsi") {
+      list.sort((a, b) => (taMap[b.symbol]?.rsi ?? -1) - (taMap[a.symbol]?.rsi ?? -1));
+    } else if (sortKey === "adx") {
+      list.sort((a, b) => (taMap[b.symbol]?.adx ?? -1) - (taMap[a.symbol]?.adx ?? -1));
+    } else {
+      list.sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume));
+    }
+    return list;
+  }, [rows, taMap, query, trendFilter, sortKey]);
+
+  return (
+    <>
+      <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <input
+          className="ft-input"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search pair, e.g. BTC, SOL…"
+          style={{
+            flex: 1,
+            minWidth: 160,
+            boxSizing: "border-box",
+            background: C.panel,
+            border: `1px solid ${C.border}`,
+            borderRadius: 8,
+            color: C.text,
+            fontSize: 13,
+            padding: "9px 12px",
+            outline: "none",
+          }}
+        />
+        {["all", "Up", "Down", "Sideways"].map((t) => (
+          <button
+            key={t}
+            className="ft-btn"
+            onClick={() => setTrendFilter(t)}
+            style={{
+              background: trendFilter === t ? C.amber : C.panel,
+              color: trendFilter === t ? "#1A1300" : C.textMuted,
+              border: `1px solid ${trendFilter === t ? C.amber : C.border}`,
+              borderRadius: 8,
+              padding: "9px 14px",
+              fontSize: 12.5,
+              fontWeight: 600,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {t === "all" ? "All trends" : t}
+          </button>
+        ))}
+        <select
+          className="ft-input"
+          value={sortKey}
+          onChange={(e) => setSortKey(e.target.value)}
+          style={{
+            background: C.panel,
+            border: `1px solid ${C.border}`,
+            borderRadius: 8,
+            color: C.text,
+            fontSize: 12.5,
+            padding: "9px 10px",
+            outline: "none",
+          }}
+        >
+          <option value="volume">Sort: Volume</option>
+          <option value="rsi">Sort: RSI</option>
+          <option value="adx">Sort: Trend strength</option>
+        </select>
+        <button
+          className="ft-btn"
+          onClick={startTaBulk}
+          disabled={taBulkStatus === "loading"}
+          style={{
+            background: C.panelRaised,
+            color: C.text,
+            border: `1px solid ${C.borderLight}`,
+            borderRadius: 8,
+            padding: "9px 14px",
+            fontSize: 12.5,
+            fontWeight: 700,
+            whiteSpace: "nowrap",
+            opacity: taBulkStatus === "loading" ? 0.6 : 1,
+          }}
+        >
+          {taBulkStatus === "loading" ? `Scanning… ${taBulkDone}/${rows.length}` : scanned > 0 ? "Rescan" : "Run scan"}
+        </button>
+      </div>
+
+      {taBulkStatus === "blocked" && (
+        <div
+          style={{
+            background: C.lossBg,
+            border: `1px solid ${C.loss}`,
+            borderRadius: 8,
+            padding: "11px 13px",
+            fontSize: 13,
+            color: C.loss,
+            marginBottom: 12,
+          }}
+        >
+          Binance has temporarily rate-limited this IP — the scan will resume automatically shortly.
+        </div>
+      )}
+
+      {scanned === 0 && taBulkStatus !== "loading" && (
+        <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 12 }}>
+          Run a scan to classify every pair's trend, strength, momentum, support/resistance and reversal signal from
+          official Binance 4h candles.
+        </div>
+      )}
+
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+          <thead>
+            <tr style={{ textAlign: "left", color: C.textMuted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.3 }}>
+              <th style={{ padding: "6px 8px" }}>Pair</th>
+              <th style={{ padding: "6px 8px" }}>Trend</th>
+              <th style={{ padding: "6px 8px" }}>Strength</th>
+              <th style={{ padding: "6px 8px" }}>Momentum</th>
+              <th style={{ padding: "6px 8px" }}>Support</th>
+              <th style={{ padding: "6px 8px" }}>Resistance</th>
+              <th style={{ padding: "6px 8px" }}>Reversal</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((r) => {
+              const t = taMap[r.symbol];
+              return (
+                <tr key={r.symbol} className="ft-row" style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <td style={{ padding: "8px 8px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <CoinIcon symbol={r.symbol} size={18} logos={logos} />
+                      <span style={{ fontWeight: 600, color: C.text }}>{r.symbol.replace("USDT", "")}</span>
+                    </div>
+                  </td>
+                  {!t ? (
+                    <td colSpan={6} style={{ padding: "8px 8px", color: C.textDim, fontFamily: mono, fontSize: 11.5 }}>
+                      {taBulkStatus === "loading" ? "scanning…" : "not scanned yet"}
+                    </td>
+                  ) : (
+                    <>
+                      <td style={{ padding: "8px 8px" }}>
+                        <TaBadge text={t.trend} tone={trendTone(t.trend)} />
+                      </td>
+                      <td style={{ padding: "8px 8px" }}>
+                        <TaBadge text={t.trendStrength} tone={strengthTone(t.trendStrength)} />
+                        {t.adx !== null && (
+                          <span style={{ marginLeft: 6, fontFamily: mono, fontSize: 11, color: C.textDim }}>
+                            ADX {t.adx.toFixed(0)}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ padding: "8px 8px" }}>
+                        <TaBadge text={t.momentum} tone={momentumTone(t.momentum)} />
+                        {t.rsi !== null && (
+                          <span style={{ marginLeft: 6, fontFamily: mono, fontSize: 11, color: C.textDim }}>
+                            RSI {t.rsi.toFixed(0)}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ padding: "8px 8px", fontFamily: mono, color: C.gain }}>
+                        {t.support != null ? t.support.toPrecision(6) : "—"}
+                        {t.nearSupportPct != null && (
+                          <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>
+                            (-{t.nearSupportPct.toFixed(1)}%)
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ padding: "8px 8px", fontFamily: mono, color: C.loss }}>
+                        {t.resistance != null ? t.resistance.toPrecision(6) : "—"}
+                        {t.nearResistancePct != null && (
+                          <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>
+                            (+{t.nearResistancePct.toFixed(1)}%)
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ padding: "8px 8px" }}>
+                        <TaBadge text={t.reversal} tone={reversalTone(t.reversal)} />
+                      </td>
+                    </>
+                  )}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ marginTop: 8, fontSize: 11, color: C.textDim, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
+        <span>{sorted.length} of {rows.length || "…"} pairs · {scanned} scanned</span>
+        <span>Based on official Binance 4h candles · EMA20/50, RSI14, ADX14, 60-candle swing levels</span>
+      </div>
+    </>
+  );
+}
 
 function AlertsPanel({
   rulesEnabled,
