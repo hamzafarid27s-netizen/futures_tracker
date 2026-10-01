@@ -60,6 +60,23 @@ async function fetchAllSamples(supabase: any, cutoffIso: string) {
   return all;
 }
 
+// ---- alert hysteresis ----
+// A value sitting right at a threshold (PNL ticking between -9.95, -10.03,
+// -9.55 run to run) would otherwise flip the edge-triggered state back and
+// forth and fire a fresh notification almost every run. Once a threshold is
+// hit, the value has to retreat past a small buffer before it's treated as
+// having genuinely reversed — mirrors the same logic in the client (App.jsx)
+// so foreground and background evaluation behave identically.
+function hysteresisBuffer(target: number) {
+  return Math.max(Math.abs(target) * 0.08, 0.3);
+}
+function passesThreshold(value: number, target: number) {
+  return target >= 0 ? value >= target : value <= target;
+}
+function staysPastThreshold(value: number, target: number, buffer: number) {
+  return target >= 0 ? value >= target - buffer : value <= target + buffer;
+}
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -198,35 +215,40 @@ Deno.serve(async (req: Request) => {
     const toFire: Array<{ deviceId: string; ruleKey: string; title: string; body: string }> = [];
     const toRemoveSubs: string[] = [];
 
-    // passes: current boolean state of the condition this cycle.
-    // onEnter: called once when it transitions from not-passing to passing.
-    // onExit: called once when it transitions from passing to not-passing
-    //   (omit for alerts that should only ever announce entering, like
-    //   price-move rules — "fell back under 4%" isn't a useful notification
-    //   for those, but is for a trade ROI/PNL target).
+    // value/target: target is the (possibly signed) threshold; value is the
+    // current reading compared against it. onEnter fires once when value
+    // first crosses target. onExit fires once value retreats back past
+    // target by a hysteresis buffer (omit for alerts that should only ever
+    // announce entering, like price-move rules — "fell back under 4%" isn't
+    // a useful notification for those, but is for a trade ROI/PNL target).
+    // The buffer dead-zone is what stops a value hovering right at the
+    // threshold from flipping state (and notifying) on every single run.
     const evalEdge = (
       deviceId: string,
       ruleKey: string,
-      passes: boolean,
+      value: number,
+      target: number,
       onEnter: () => { title: string; body: string },
       onExit?: () => { title: string; body: string }
     ) => {
       const key = `${deviceId}|${ruleKey}`;
       seenKeys.add(key);
       const wasActive = activeMap[key] ?? false;
-      if (passes && !wasActive) {
+      if (!wasActive && passesThreshold(value, target)) {
         const msg = onEnter();
         toFire.push({ deviceId, ruleKey, ...msg });
         stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: true, updated_at: new Date(nowMs).toISOString() });
-      } else if (!passes && wasActive) {
+      } else if (wasActive && !staysPastThreshold(value, target, hysteresisBuffer(target))) {
         if (onExit) {
           const msg = onExit();
           toFire.push({ deviceId, ruleKey, ...msg });
         }
         stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: false, updated_at: new Date(nowMs).toISOString() });
       }
-      // passes === wasActive: condition unchanged since last run — no
-      // notification, no write. This is what stops the repeat-spam.
+      // Otherwise state is unchanged (or still inside the dead zone) since
+      // last run — no notification, no write. This is what stops the
+      // repeat-spam, both for a long-passing condition and for a value
+      // wobbling right at the line.
     };
 
     const labelFor = (min: number) => {
@@ -267,8 +289,7 @@ Deno.serve(async (req: Request) => {
         for (const sym of Object.keys(currentPrice)) {
           const chg = changes[sym]?.[rule.min];
           if (chg === null || chg === undefined) continue;
-          const passes = Math.abs(chg) >= rule.pct;
-          evalEdge(deviceId, `default:${rule.min}|${sym}`, passes, () => ({
+          evalEdge(deviceId, `default:${rule.min}|${sym}`, Math.abs(chg), rule.pct, () => ({
             title: `${sym.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
             body: `Moved ${chg >= 0 ? "up" : "down"} more than ${rule.pct}% in ${rule.min}m`,
           }));
@@ -283,8 +304,8 @@ Deno.serve(async (req: Request) => {
         for (const sym of Object.keys(currentPrice)) {
           const chg = changes[sym]?.[min];
           if (chg === null || chg === undefined) continue;
-          const passes = g.dir === "either" ? Math.abs(chg) >= g.pct : g.dir === "up" ? chg >= g.pct : -chg >= g.pct;
-          evalEdge(deviceId, `global:${g.id}|${sym}`, passes, () => ({
+          const value = g.dir === "either" ? Math.abs(chg) : g.dir === "up" ? chg : -chg;
+          evalEdge(deviceId, `global:${g.id}|${sym}`, value, g.pct, () => ({
             title: `${sym.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
             body: `Passed your ±${g.pct}% / ${labelFor(min)} alert`,
           }));
@@ -296,8 +317,8 @@ Deno.serve(async (req: Request) => {
         const min = Math.max(5, Math.min(GLOBAL_BG_MAX_MIN, Math.round(c.min)));
         const chg = changes[c.symbol]?.[min];
         if (chg === null || chg === undefined) continue;
-        const passes = c.dir === "either" ? Math.abs(chg) >= c.pct : c.dir === "up" ? chg >= c.pct : -chg >= c.pct;
-        evalEdge(deviceId, `custom:${c.id}`, passes, () => ({
+        const value = c.dir === "either" ? Math.abs(chg) : c.dir === "up" ? chg : -chg;
+        evalEdge(deviceId, `custom:${c.id}`, value, c.pct, () => ({
           title: `${c.symbol.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
           body: `Passed your ±${c.pct}% / ${labelFor(min)} alert`,
         }));
@@ -346,11 +367,11 @@ Deno.serve(async (req: Request) => {
           // only ever firing on the way in.
           for (const a of t.roiAlerts ?? []) {
             if (roi === null) continue;
-            const passes = a.pct >= 0 ? roi >= a.pct : roi <= a.pct;
             evalEdge(
               deviceId,
               `roi:${t.id}:${a.id}`,
-              passes,
+              roi,
+              a.pct,
               () => ({
                 title: `${t.symbol.replace("USDT", "/USDT")} ROI target hit`,
                 body: `Target ${a.pct >= 0 ? "+" : ""}${a.pct}% · now ${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`,
@@ -365,11 +386,11 @@ Deno.serve(async (req: Request) => {
           // Custom PNL (USDT) targets — same signed-threshold convention and
           // same two-way edge triggering as ROI targets above.
           for (const a of t.pnlAlerts ?? []) {
-            const passes = a.value >= 0 ? pnl >= a.value : pnl <= a.value;
             evalEdge(
               deviceId,
               `pnl:${t.id}:${a.id}`,
-              passes,
+              pnl,
+              a.value,
               () => ({
                 title: `${t.symbol.replace("USDT", "/USDT")} PNL target hit`,
                 body: `Target ${a.value >= 0 ? "+" : ""}${a.value} USDT · now ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT`,

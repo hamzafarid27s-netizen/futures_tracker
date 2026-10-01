@@ -176,6 +176,23 @@ function pctColor(n) {
   return n >= 0 ? C.gain : C.loss;
 }
 
+// ---- alert hysteresis ----
+// A value that hovers right at a threshold (e.g. PNL sitting at -9.95,
+// -10.03, -9.55 tick to tick) would otherwise flip the edge-triggered state
+// back and forth and fire a fresh notification on every tiny wobble. Once a
+// threshold is hit, require the value to retreat past a small buffer before
+// it's considered to have genuinely reversed — that buffer is the "dead
+// zone" where the alert stays in whatever state it's already in.
+function hysteresisBuffer(target) {
+  return Math.max(Math.abs(target) * 0.08, 0.3);
+}
+function passesThreshold(value, target) {
+  return target >= 0 ? value >= target : value <= target;
+}
+function staysPastThreshold(value, target, buffer) {
+  return target >= 0 ? value >= target - buffer : value <= target + buffer;
+}
+
 // ---- shared Binance rate-limit guard ----
 // Every call to fapi.binance.com goes through this, so a single 418/429
 // anywhere (bulk ATH/ATL, the main ticker poll, bootstrap, anything) stops
@@ -956,12 +973,15 @@ export default function FuturesTracker() {
   useEffect(() => {
     const id = setInterval(() => {
       const active = ruleActiveRef.current;
-      const checkEdge = (key, passes, fire) => {
+      // value/target are both expressed so target is always the positive
+      // (or correctly-signed) threshold magnitude — passesThreshold/
+      // staysPastThreshold handle the hysteresis dead-zone from there.
+      const checkEdge = (key, value, target, fire) => {
         const was = !!active[key];
-        if (passes && !was) {
+        if (!was && passesThreshold(value, target)) {
           active[key] = true;
           fire();
-        } else if (!passes && was) {
+        } else if (was && !staysPastThreshold(value, target, hysteresisBuffer(target))) {
           active[key] = false;
         }
       };
@@ -973,8 +993,7 @@ export default function FuturesTracker() {
             const pct = defaultRulePcts[rule.min] ?? rule.pct;
             const chg = changeFromBuffer(sym, rule.min);
             if (chg === null) return;
-            const passes = Math.abs(chg) >= pct;
-            checkEdge(`default:${rule.min}|${sym}`, passes, () =>
+            checkEdge(`default:${rule.min}|${sym}`, Math.abs(chg), pct, () =>
               fireAlert("default:" + rule.min, sym, rule.min, pct, chg)
             );
           });
@@ -990,17 +1009,15 @@ export default function FuturesTracker() {
             chg = dd && dd.changes ? dd.changes[a.min] : null;
           }
           if (chg === null || !isFinite(chg)) return;
-          const passes =
-            a.dir === "either" ? Math.abs(chg) >= a.pct : a.dir === "up" ? chg >= a.pct : -chg >= a.pct;
-          checkEdge(`custom:${a.id}`, passes, () => fireAlert("custom:" + a.id, a.symbol, a.min, a.pct, chg));
+          const value = a.dir === "either" ? Math.abs(chg) : a.dir === "up" ? chg : -chg;
+          checkEdge(`custom:${a.id}`, value, a.pct, () => fireAlert("custom:" + a.id, a.symbol, a.min, a.pct, chg));
         });
         globalAlerts.forEach((g) => {
           rows.forEach((r) => {
             const chg = changeFromBuffer(r.symbol, g.min);
             if (chg === null || !isFinite(chg)) return;
-            const passes =
-              g.dir === "either" ? Math.abs(chg) >= g.pct : g.dir === "up" ? chg >= g.pct : -chg >= g.pct;
-            checkEdge(`global:${g.id}|${r.symbol}`, passes, () => fireAlert("global:" + g.id, r.symbol, g.min, g.pct, chg));
+            const value = g.dir === "either" ? Math.abs(chg) : g.dir === "up" ? chg : -chg;
+            checkEdge(`global:${g.id}|${r.symbol}`, value, g.pct, () => fireAlert("global:" + g.id, r.symbol, g.min, g.pct, chg));
           });
         });
       }
@@ -1038,25 +1055,23 @@ export default function FuturesTracker() {
       const activeT = tradeThresholdActiveRef.current;
       (t.roiAlerts || []).forEach((a) => {
         if (roi === null) return;
-        const passes = a.pct >= 0 ? roi >= a.pct : roi <= a.pct;
         const key = t.id + ":roi:" + a.id;
         const was = !!activeT[key];
-        if (passes && !was) {
+        if (!was && passesThreshold(roi, a.pct)) {
           activeT[key] = true;
           fireTradeThreshold(t, "roi", a.pct, roi, "hit");
-        } else if (!passes && was) {
+        } else if (was && !staysPastThreshold(roi, a.pct, hysteresisBuffer(a.pct))) {
           activeT[key] = false;
           fireTradeThreshold(t, "roi", a.pct, roi, "reversed");
         }
       });
       (t.pnlAlerts || []).forEach((a) => {
-        const passes = a.value >= 0 ? pnlUsdt >= a.value : pnlUsdt <= a.value;
         const key = t.id + ":pnl:" + a.id;
         const was = !!activeT[key];
-        if (passes && !was) {
+        if (!was && passesThreshold(pnlUsdt, a.value)) {
           activeT[key] = true;
           fireTradeThreshold(t, "pnl", a.value, pnlUsdt, "hit");
-        } else if (!passes && was) {
+        } else if (was && !staysPastThreshold(pnlUsdt, a.value, hysteresisBuffer(a.value))) {
           activeT[key] = false;
           fireTradeThreshold(t, "pnl", a.value, pnlUsdt, "reversed");
         }
