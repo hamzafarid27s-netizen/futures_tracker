@@ -328,10 +328,16 @@ export default function FuturesTracker() {
   const [extChangeBulkStatus, setExtChangeBulkStatus] = useState("idle"); // idle | loading | done | blocked
   const [extChangeBulkDone, setExtChangeBulkDone] = useState(0);
   const tradeSignRef = useRef({});
-  const tradeThresholdFiredRef = useRef({});
+  // Edge-triggered "is this rule currently passing?" state, keyed by rule
+  // key (+ symbol for price rules). Replaces cooldown-timer firing: a
+  // notification goes out only on the false->true transition (and, for
+  // trade ROI/PNL targets, also on true->false), never on every tick while
+  // the condition stays true — that repeat-while-true behavior was the
+  // "same alert notification multiple times" bug.
+  const ruleActiveRef = useRef({});
+  const tradeThresholdActiveRef = useRef({});
 
   const bufferRef = useRef({}); // symbol -> [{t, price}]
-  const lastFiredRef = useRef({});
   const storageLoaded = useRef(false);
 
   // ---- load persisted state ----
@@ -640,11 +646,7 @@ export default function FuturesTracker() {
   // ---- fire an alert (in-app + best-effort browser notification) ----
   const fireAlert = useCallback(
     (ruleId, symbol, minutes, thresholdPct, actualChange) => {
-      const key = ruleId + "|" + symbol;
       const now = Date.now();
-      const cooldown = Math.max(minutes * 60000, 60000);
-      if (lastFiredRef.current[key] && now - lastFiredRef.current[key] < cooldown) return;
-      lastFiredRef.current[key] = now;
       const intervalLabel = INTERVALS.find((i) => i.min === minutes)?.label || minutes + "m";
       const event = {
         id: symbol + "-" + minutes + "-" + now,
@@ -694,15 +696,17 @@ export default function FuturesTracker() {
     }
   }, []);
 
-  // ---- trade ROI% / PNL$ target-hit notification ----
-  const fireTradeThreshold = useCallback((trade, kind, target, actual) => {
+  // ---- trade ROI% / PNL$ target notification (entered target, or reversed back past it) ----
+  const fireTradeThreshold = useCallback((trade, kind, target, actual, direction = "hit") => {
     const now = Date.now();
     const unit = kind === "roi" ? "%" : " USDT";
+    const kindLabel = kind === "roi" ? "ROI" : "PNL";
+    const titleVerb = direction === "hit" ? "target hit" : "back past target";
     const event = {
-      id: trade.id + "-" + kind + "-" + target + "-" + now,
+      id: trade.id + "-" + kind + "-" + target + "-" + direction + "-" + now,
       symbol: trade.symbol,
       minutes: null,
-      label: `${kind === "roi" ? "ROI" : "PNL"} target ${target >= 0 ? "+" : ""}${target}${unit} hit`,
+      label: `${kindLabel} ${titleVerb}: target ${target >= 0 ? "+" : ""}${target}${unit}`,
       thresholdPct: null,
       actualChange: actual,
       time: now,
@@ -711,7 +715,7 @@ export default function FuturesTracker() {
     setTriggered((prev) => [event, ...prev].slice(0, 50));
     if (typeof Notification !== "undefined" && Notification.permission === "granted") {
       try {
-        new Notification(`${trade.symbol.replace("USDT", "/USDT")} ${kind === "roi" ? "ROI" : "PNL"} target hit`, {
+        new Notification(`${trade.symbol.replace("USDT", "/USDT")} ${kindLabel} ${titleVerb}`, {
           body: `Target ${target >= 0 ? "+" : ""}${target}${unit} · now ${actual >= 0 ? "+" : ""}${actual.toFixed(2)}${unit}`,
         });
       } catch {
@@ -855,16 +859,33 @@ export default function FuturesTracker() {
   }, []);
 
   // ---- alert evaluation every ~5s using buffer + cached detail data ----
+  // Edge-triggered: a rule key only fires fireAlert() on the false->true
+  // transition (passes now, didn't last tick). While a move stays past the
+  // threshold it keeps "passing" every tick but ruleActiveRef is already
+  // true, so nothing fires again — and once it drops back under the
+  // threshold the key resets to false so the next real crossing can fire.
   useEffect(() => {
     const id = setInterval(() => {
+      const active = ruleActiveRef.current;
+      const checkEdge = (key, passes, fire) => {
+        const was = !!active[key];
+        if (passes && !was) {
+          active[key] = true;
+          fire();
+        } else if (!passes && was) {
+          active[key] = false;
+        }
+      };
       rows.forEach((r) => {
         const sym = r.symbol;
         DEFAULT_RULES.forEach((rule) => {
           if (!rulesEnabled[rule.min]) return;
           const chg = changeFromBuffer(sym, rule.min);
-          if (chg !== null && Math.abs(chg) >= rule.pct) {
-            fireAlert("default:" + rule.min, sym, rule.min, rule.pct, chg);
-          }
+          if (chg === null) return;
+          const passes = Math.abs(chg) >= rule.pct;
+          checkEdge(`default:${rule.min}|${sym}`, passes, () =>
+            fireAlert("default:" + rule.min, sym, rule.min, rule.pct, chg)
+          );
         });
       });
       customAlerts.forEach((a) => {
@@ -878,7 +899,7 @@ export default function FuturesTracker() {
         if (chg === null || !isFinite(chg)) return;
         const passes =
           a.dir === "either" ? Math.abs(chg) >= a.pct : a.dir === "up" ? chg >= a.pct : -chg >= a.pct;
-        if (passes) fireAlert("custom:" + a.id, a.symbol, a.min, a.pct, chg);
+        checkEdge(`custom:${a.id}`, passes, () => fireAlert("custom:" + a.id, a.symbol, a.min, a.pct, chg));
       });
       globalAlerts.forEach((g) => {
         rows.forEach((r) => {
@@ -886,18 +907,23 @@ export default function FuturesTracker() {
           if (chg === null || !isFinite(chg)) return;
           const passes =
             g.dir === "either" ? Math.abs(chg) >= g.pct : g.dir === "up" ? chg >= g.pct : -chg >= g.pct;
-          if (passes) fireAlert("global:" + g.id, r.symbol, g.min, g.pct, chg);
+          checkEdge(`global:${g.id}|${r.symbol}`, passes, () => fireAlert("global:" + g.id, r.symbol, g.min, g.pct, chg));
         });
       });
     }, 5000);
     return () => clearInterval(id);
   }, [rows, rulesEnabled, customAlerts, globalAlerts, detailData, changeFromBuffer, fireAlert]);
 
-  // ---- saved trade PnL sign-flip + ROI%/PNL$ target-hit notifications ----
-  const TRADE_THRESHOLD_COOLDOWN_MS = 15 * 60000;
+  // ---- saved trade PnL sign-flip + ROI%/PNL$ target notifications ----
+  // ROI/PNL targets are edge-triggered both directions: fire once on
+  // crossing INTO the target, and fire again if the value later crosses
+  // back OUT of it (e.g. ROI climbs past +10% then drops back under +10%)
+  // — a reversal is just as notification-worthy as reaching the target in
+  // the first place, and this also stops the multi-notification pileup
+  // that happened when several thresholds were satisfied at once, since
+  // each threshold now fires once per crossing rather than on every tick.
   useEffect(() => {
     if (savedTrades.length === 0 || rows.length === 0) return;
-    const now = Date.now();
     savedTrades.forEach((t) => {
       const row = rows.find((r) => r.symbol === t.symbol);
       if (!row) return;
@@ -915,23 +941,30 @@ export default function FuturesTracker() {
       const pnlUsdt = t.dir === "long" ? ((current - t.entry) / t.entry) * sizeUsdt : ((t.entry - current) / t.entry) * sizeUsdt;
       const roi = t.margin ? (pnlUsdt / t.margin) * 100 : null;
 
+      const activeT = tradeThresholdActiveRef.current;
       (t.roiAlerts || []).forEach((a) => {
         if (roi === null) return;
-        const hit = a.pct >= 0 ? roi >= a.pct : roi <= a.pct;
+        const passes = a.pct >= 0 ? roi >= a.pct : roi <= a.pct;
         const key = t.id + ":roi:" + a.id;
-        const last = tradeThresholdFiredRef.current[key];
-        if (hit && (!last || now - last >= TRADE_THRESHOLD_COOLDOWN_MS)) {
-          fireTradeThreshold(t, "roi", a.pct, roi);
-          tradeThresholdFiredRef.current[key] = now;
+        const was = !!activeT[key];
+        if (passes && !was) {
+          activeT[key] = true;
+          fireTradeThreshold(t, "roi", a.pct, roi, "hit");
+        } else if (!passes && was) {
+          activeT[key] = false;
+          fireTradeThreshold(t, "roi", a.pct, roi, "reversed");
         }
       });
       (t.pnlAlerts || []).forEach((a) => {
-        const hit = a.value >= 0 ? pnlUsdt >= a.value : pnlUsdt <= a.value;
+        const passes = a.value >= 0 ? pnlUsdt >= a.value : pnlUsdt <= a.value;
         const key = t.id + ":pnl:" + a.id;
-        const last = tradeThresholdFiredRef.current[key];
-        if (hit && (!last || now - last >= TRADE_THRESHOLD_COOLDOWN_MS)) {
-          fireTradeThreshold(t, "pnl", a.value, pnlUsdt);
-          tradeThresholdFiredRef.current[key] = now;
+        const was = !!activeT[key];
+        if (passes && !was) {
+          activeT[key] = true;
+          fireTradeThreshold(t, "pnl", a.value, pnlUsdt, "hit");
+        } else if (!passes && was) {
+          activeT[key] = false;
+          fireTradeThreshold(t, "pnl", a.value, pnlUsdt, "reversed");
         }
       });
     });

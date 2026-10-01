@@ -175,30 +175,58 @@ Deno.serve(async (req: Request) => {
       });
     });
 
-    // ---- 4. cooldown state ----
-    // Prune anything older than the longest possible cooldown (24h, since
-    // GLOBAL_BG_MAX_MIN caps every interval there) BEFORE reading — keeps
-    // this table bounded by "how many rules are active" rather than growing
-    // forever, so it never approaches the same 1000-row fetch limit that
-    // caused the price_samples bug above.
-    await supabase.from("alert_fired_log").delete().lt("fired_at", new Date(nowMs - 25 * 60 * 60_000).toISOString());
-    const { data: fired } = await supabase
-      .from("alert_fired_log")
-      .select("device_id, rule_key, fired_at");
-    const lastFired: Record<string, number> = {};
-    (fired ?? []).forEach((f: any) => {
-      lastFired[`${f.device_id}|${f.rule_key}`] = new Date(f.fired_at).getTime();
+    // ---- 4. rule state (edge-triggered crossing detection) ----
+    // A rule_key is "active" while its condition is currently true. A
+    // notification fires only on the transition — false→true (the
+    // threshold was just crossed) — never on every evaluation while the
+    // condition stays true, which is what caused the same alert to repeat
+    // every cooldown period for as long as a move or a trade stayed past
+    // its threshold. ROI/PNL trade-target alerts also notify on the
+    // reverse transition — true→false (value crossed back through the
+    // target) — since those are meant to tell the user both when a target
+    // is reached AND when it's given back.
+    const { data: ruleStateRows } = await supabase
+      .from("alert_rule_state")
+      .select("device_id, rule_key, is_active");
+    const activeMap: Record<string, boolean> = {};
+    (ruleStateRows ?? []).forEach((r: any) => {
+      activeMap[`${r.device_id}|${r.rule_key}`] = r.is_active;
     });
+    const stateUpdates: Array<{ device_id: string; rule_key: string; is_active: boolean; updated_at: string }> = [];
+    const seenKeys = new Set<string>();
 
     const toFire: Array<{ deviceId: string; ruleKey: string; title: string; body: string }> = [];
     const toRemoveSubs: string[] = [];
 
-    const cooldownOk = (deviceId: string, ruleKey: string, minutes: number) => {
+    // passes: current boolean state of the condition this cycle.
+    // onEnter: called once when it transitions from not-passing to passing.
+    // onExit: called once when it transitions from passing to not-passing
+    //   (omit for alerts that should only ever announce entering, like
+    //   price-move rules — "fell back under 4%" isn't a useful notification
+    //   for those, but is for a trade ROI/PNL target).
+    const evalEdge = (
+      deviceId: string,
+      ruleKey: string,
+      passes: boolean,
+      onEnter: () => { title: string; body: string },
+      onExit?: () => { title: string; body: string }
+    ) => {
       const key = `${deviceId}|${ruleKey}`;
-      const cooldownMs = Math.max(minutes * 60_000, 60_000);
-      const prev = lastFired[key];
-      if (prev && nowMs - prev < cooldownMs) return false;
-      return true;
+      seenKeys.add(key);
+      const wasActive = activeMap[key] ?? false;
+      if (passes && !wasActive) {
+        const msg = onEnter();
+        toFire.push({ deviceId, ruleKey, ...msg });
+        stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: true, updated_at: new Date(nowMs).toISOString() });
+      } else if (!passes && wasActive) {
+        if (onExit) {
+          const msg = onExit();
+          toFire.push({ deviceId, ruleKey, ...msg });
+        }
+        stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: false, updated_at: new Date(nowMs).toISOString() });
+      }
+      // passes === wasActive: condition unchanged since last run — no
+      // notification, no write. This is what stops the repeat-spam.
     };
 
     const labelFor = (min: number) => {
@@ -224,24 +252,19 @@ Deno.serve(async (req: Request) => {
         { min: 60, pct: 10 },
       ];
 
-      // default rules — every symbol
+      // default rules — every symbol. Fires once when a pair crosses past
+      // the threshold; resets (silently) once it falls back under it, so
+      // the next genuine crossing can fire again.
       for (const rule of DEFAULT_RULES) {
         if (!rulesEnabled[String(rule.min)]) continue;
         for (const sym of Object.keys(currentPrice)) {
           const chg = changes[sym]?.[rule.min];
           if (chg === null || chg === undefined) continue;
-          if (Math.abs(chg) >= rule.pct) {
-            const ruleKey = `default:${rule.min}|${sym}`;
-            if (cooldownOk(deviceId, ruleKey, rule.min)) {
-              toFire.push({
-                deviceId,
-                ruleKey,
-                title: `${sym.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
-                body: `Moved ${chg >= 0 ? "up" : "down"} more than ${rule.pct}% in ${rule.min}m`,
-              });
-              lastFired[`${deviceId}|${ruleKey}`] = nowMs;
-            }
-          }
+          const passes = Math.abs(chg) >= rule.pct;
+          evalEdge(deviceId, `default:${rule.min}|${sym}`, passes, () => ({
+            title: `${sym.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
+            body: `Moved ${chg >= 0 ? "up" : "down"} more than ${rule.pct}% in ${rule.min}m`,
+          }));
         }
       }
 
@@ -252,18 +275,10 @@ Deno.serve(async (req: Request) => {
           const chg = changes[sym]?.[min];
           if (chg === null || chg === undefined) continue;
           const passes = g.dir === "either" ? Math.abs(chg) >= g.pct : g.dir === "up" ? chg >= g.pct : -chg >= g.pct;
-          if (passes) {
-            const ruleKey = `global:${g.id}|${sym}`;
-            if (cooldownOk(deviceId, ruleKey, min)) {
-              toFire.push({
-                deviceId,
-                ruleKey,
-                title: `${sym.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
-                body: `Passed your ±${g.pct}% / ${labelFor(min)} alert`,
-              });
-              lastFired[`${deviceId}|${ruleKey}`] = nowMs;
-            }
-          }
+          evalEdge(deviceId, `global:${g.id}|${sym}`, passes, () => ({
+            title: `${sym.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
+            body: `Passed your ±${g.pct}% / ${labelFor(min)} alert`,
+          }));
         }
       }
 
@@ -273,18 +288,10 @@ Deno.serve(async (req: Request) => {
         const chg = changes[c.symbol]?.[min];
         if (chg === null || chg === undefined) continue;
         const passes = c.dir === "either" ? Math.abs(chg) >= c.pct : c.dir === "up" ? chg >= c.pct : -chg >= c.pct;
-        if (passes) {
-          const ruleKey = `custom:${c.id}`;
-          if (cooldownOk(deviceId, ruleKey, min)) {
-            toFire.push({
-              deviceId,
-              ruleKey,
-              title: `${c.symbol.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
-              body: `Passed your ±${c.pct}% / ${labelFor(min)} alert`,
-            });
-            lastFired[`${deviceId}|${ruleKey}`] = nowMs;
-          }
-        }
+        evalEdge(deviceId, `custom:${c.id}`, passes, () => ({
+          title: `${c.symbol.replace("USDT", "/USDT")} ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`,
+          body: `Passed your ±${c.pct}% / ${labelFor(min)} alert`,
+        }));
       }
 
       // tracked-trade PnL flip alerts + custom ROI%/PNL$ target alerts
@@ -322,39 +329,47 @@ Deno.serve(async (req: Request) => {
             .from("trade_pnl_state")
             .upsert({ device_id: deviceId, trade_id: t.id, was_positive: nowPositive, updated_at: new Date(nowMs).toISOString() });
 
-          // Custom ROI% targets — signed threshold: positive fires on reaching
-          // that gain, negative fires on dropping to that loss. 15-minute
-          // cooldown (fixed, since these aren't tied to a lookback window).
+          // Custom ROI% targets — signed threshold: positive fires on rising
+          // to/above that gain, negative fires on dropping to/below that
+          // loss. Edge-triggered both ways: fires once when the target is
+          // reached, AND fires again if ROI later crosses back through it
+          // (e.g. climbs above +10% then drops back under +10%), instead of
+          // only ever firing on the way in.
           for (const a of t.roiAlerts ?? []) {
             if (roi === null) continue;
-            const hit = a.pct >= 0 ? roi >= a.pct : roi <= a.pct;
-            if (!hit) continue;
-            const ruleKey = `roi:${t.id}:${a.id}`;
-            if (cooldownOk(deviceId, ruleKey, 15)) {
-              toFire.push({
-                deviceId,
-                ruleKey,
+            const passes = a.pct >= 0 ? roi >= a.pct : roi <= a.pct;
+            evalEdge(
+              deviceId,
+              `roi:${t.id}:${a.id}`,
+              passes,
+              () => ({
                 title: `${t.symbol.replace("USDT", "/USDT")} ROI target hit`,
                 body: `Target ${a.pct >= 0 ? "+" : ""}${a.pct}% · now ${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`,
-              });
-              lastFired[`${deviceId}|${ruleKey}`] = nowMs;
-            }
+              }),
+              () => ({
+                title: `${t.symbol.replace("USDT", "/USDT")} ROI back past target`,
+                body: `Target ${a.pct >= 0 ? "+" : ""}${a.pct}% · now ${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`,
+              })
+            );
           }
 
-          // Custom PNL (USDT) targets — same signed-threshold convention.
+          // Custom PNL (USDT) targets — same signed-threshold convention and
+          // same two-way edge triggering as ROI targets above.
           for (const a of t.pnlAlerts ?? []) {
-            const hit = a.value >= 0 ? pnl >= a.value : pnl <= a.value;
-            if (!hit) continue;
-            const ruleKey = `pnl:${t.id}:${a.id}`;
-            if (cooldownOk(deviceId, ruleKey, 15)) {
-              toFire.push({
-                deviceId,
-                ruleKey,
+            const passes = a.value >= 0 ? pnl >= a.value : pnl <= a.value;
+            evalEdge(
+              deviceId,
+              `pnl:${t.id}:${a.id}`,
+              passes,
+              () => ({
                 title: `${t.symbol.replace("USDT", "/USDT")} PNL target hit`,
                 body: `Target ${a.value >= 0 ? "+" : ""}${a.value} USDT · now ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT`,
-              });
-              lastFired[`${deviceId}|${ruleKey}`] = nowMs;
-            }
+              }),
+              () => ({
+                title: `${t.symbol.replace("USDT", "/USDT")} PNL back past target`,
+                body: `Target ${a.value >= 0 ? "+" : ""}${a.value} USDT · now ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT`,
+              })
+            );
           }
         }
       }
@@ -380,14 +395,25 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // ---- 6. persist cooldown records + cleanup dead subscriptions ----
-    if (toFire.length) {
-      await supabase.from("alert_fired_log").upsert(
-        toFire.map((f) => ({ device_id: f.deviceId, rule_key: f.ruleKey, fired_at: new Date(nowMs).toISOString() }))
-      );
+    // ---- 6. persist rule state + cleanup dead subscriptions/stale state ----
+    if (stateUpdates.length) {
+      for (let i = 0; i < stateUpdates.length; i += 500) {
+        await supabase.from("alert_rule_state").upsert(stateUpdates.slice(i, i + 500));
+      }
     }
     if (toRemoveSubs.length) {
       await supabase.from("push_subscriptions").delete().in("device_id", [...new Set(toRemoveSubs)]);
+    }
+    // Drop state rows for rule_keys that no longer belong to any config this
+    // run evaluated for that device (alert deleted, trade removed, etc.) so
+    // the table doesn't grow forever with orphaned keys.
+    const staleActive = (ruleStateRows ?? []).filter(
+      (r: any) => subByDevice[r.device_id] && !seenKeys.has(`${r.device_id}|${r.rule_key}`)
+    );
+    if (staleActive.length) {
+      for (const r of staleActive) {
+        await supabase.from("alert_rule_state").delete().eq("device_id", r.device_id).eq("rule_key", r.rule_key);
+      }
     }
 
     return json({
