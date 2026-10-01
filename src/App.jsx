@@ -3577,38 +3577,33 @@ function ScreenerPanel({
           <option value="rsi">Sort: RSI</option>
           <option value="adx">Sort: Trend strength</option>
         </select>
-        {!serverMode && (
-          <button
-            className="ft-btn"
-            onClick={startTaBulk}
-            disabled={taBulkStatus === "loading"}
-            style={{
-              background: C.panelRaised,
-              color: C.text,
-              border: `1px solid ${C.borderLight}`,
-              borderRadius: 8,
-              padding: "9px 14px",
-              fontSize: 12.5,
-              fontWeight: 700,
-              whiteSpace: "nowrap",
-              opacity: taBulkStatus === "loading" ? 0.6 : 1,
-            }}
-          >
-            {taBulkStatus === "loading" ? `Scanning… ${taBulkDone}/${rows.length}` : scanned > 0 ? "Rescan" : "Run scan"}
-          </button>
-        )}
+        <button
+          className="ft-btn"
+          onClick={startTaBulk}
+          disabled={taBulkStatus === "loading"}
+          style={{
+            background: C.panelRaised,
+            color: C.text,
+            border: `1px solid ${C.borderLight}`,
+            borderRadius: 8,
+            padding: "9px 14px",
+            fontSize: 12.5,
+            fontWeight: 700,
+            whiteSpace: "nowrap",
+            opacity: taBulkStatus === "loading" ? 0.6 : 1,
+          }}
+        >
+          {taBulkStatus === "loading" ? `Scanning… ${taBulkDone}/${rows.length}` : scanned > 0 ? "Rescan" : "Run scan"}
+        </button>
       </div>
 
       <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
-        <span style={{ fontSize: 10.5, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em" }}>
-          Near a level:
-        </span>
         {levelBtn("support", "Support")}
         {levelBtn("resistance", "Resistance")}
         {levelBtn("reversal", "Reversal")}
       </div>
 
-      {!serverMode && taBulkStatus === "blocked" && (
+      {taBulkStatus === "blocked" && (
         <div
           style={{
             background: C.lossBg,
