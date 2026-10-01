@@ -244,18 +244,25 @@ Deno.serve(async (req: Request) => {
       const customAlerts = (cfg.custom_alerts ?? []) as Array<{ id: string; symbol: string; min: number; pct: number; dir: string }>;
       const globalAlerts = (cfg.global_alerts ?? []) as Array<{ id: string; min: number; pct: number; dir: string }>;
       const savedTrades = (cfg.saved_trades ?? []) as Array<{ id: string; symbol: string; entry: number; margin: number; leverage: number; dir: string }>;
+      // Master switches (default true for configs saved before these
+      // existed) and user-editable default-rule percentages (default to
+      // the original hardcoded 4/6/8/10 when a device hasn't changed them).
+      const globalRulesMasterOn = cfg.global_rules_master_on ?? true;
+      const otherAlertsMasterOn = cfg.other_alerts_master_on ?? true;
+      const defaultRulePcts = (cfg.default_rule_pcts ?? {}) as Record<string, number>;
 
       const DEFAULT_RULES = [
-        { min: 5, pct: 4 },
-        { min: 15, pct: 6 },
-        { min: 30, pct: 8 },
-        { min: 60, pct: 10 },
+        { min: 5, pct: defaultRulePcts["5"] ?? 4 },
+        { min: 15, pct: defaultRulePcts["15"] ?? 6 },
+        { min: 30, pct: defaultRulePcts["30"] ?? 8 },
+        { min: 60, pct: defaultRulePcts["60"] ?? 10 },
       ];
 
       // default rules — every symbol. Fires once when a pair crosses past
       // the threshold; resets (silently) once it falls back under it, so
-      // the next genuine crossing can fire again.
-      for (const rule of DEFAULT_RULES) {
+      // the next genuine crossing can fire again. Skipped entirely while
+      // the "global rules" master switch is off.
+      for (const rule of globalRulesMasterOn ? DEFAULT_RULES : []) {
         if (!rulesEnabled[String(rule.min)]) continue;
         for (const sym of Object.keys(currentPrice)) {
           const chg = changes[sym]?.[rule.min];
@@ -268,8 +275,10 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // global alerts — any pair, any interval up to GLOBAL_BG_MAX_MIN
-      for (const g of globalAlerts) {
+      // global alerts — any pair, any interval up to GLOBAL_BG_MAX_MIN.
+      // Skipped (along with custom alerts below) while the shared
+      // "global + custom alerts" master switch is off.
+      for (const g of otherAlertsMasterOn ? globalAlerts : []) {
         const min = Math.max(5, Math.min(GLOBAL_BG_MAX_MIN, Math.round(g.min)));
         for (const sym of Object.keys(currentPrice)) {
           const chg = changes[sym]?.[min];
@@ -283,7 +292,7 @@ Deno.serve(async (req: Request) => {
       }
 
       // custom alerts — one specific pair, any interval up to GLOBAL_BG_MAX_MIN
-      for (const c of customAlerts) {
+      for (const c of otherAlertsMasterOn ? customAlerts : []) {
         const min = Math.max(5, Math.min(GLOBAL_BG_MAX_MIN, Math.round(c.min)));
         const chg = changes[c.symbol]?.[min];
         if (chg === null || chg === undefined) continue;

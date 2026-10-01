@@ -307,6 +307,16 @@ export default function FuturesTracker() {
   const [globalAlerts, setGlobalAlerts] = useState([]); // {id, min, pct, dir} — applies to every pair
   const [newGlobalAlertForm, setNewGlobalAlertForm] = useState({ min: 15, pct: 5, dir: "either", customAmount: 2, customUnit: "h" });
   const [rulesEnabled, setRulesEnabled] = useState({ 5: true, 15: true, 30: true, 60: true });
+  // Master switches: one for the 4 default "global rules" as a group, one
+  // shared between global alerts and custom alerts (per-pair/per-rule
+  // checkboxes above still narrow things further when the master is on).
+  const [globalRulesMasterOn, setGlobalRulesMasterOn] = useState(true);
+  const [otherAlertsMasterOn, setOtherAlertsMasterOn] = useState(true);
+  // User-editable % thresholds for the 5m/15m/30m/1h default rules
+  // (minutes stay fixed; only the percent is adjustable).
+  const [defaultRulePcts, setDefaultRulePcts] = useState(() =>
+    Object.fromEntries(DEFAULT_RULES.map((r) => [r.min, r.pct]))
+  );
   const [triggered, setTriggered] = useState([]);
   const [notifPerm, setNotifPerm] = useState(
     typeof Notification !== "undefined" ? Notification.permission : "unsupported"
@@ -343,18 +353,24 @@ export default function FuturesTracker() {
   // ---- load persisted state ----
   useEffect(() => {
     (async () => {
-      const [wl, ca, ga, re, tf] = await Promise.all([
+      const [wl, ca, ga, re, tf, grm, oam, drp] = await Promise.all([
         safeStorageGet("watchlist"),
         safeStorageGet("custom-alerts"),
         safeStorageGet("global-alerts"),
         safeStorageGet("rules-enabled"),
         safeStorageGet("triggered-feed"),
+        safeStorageGet("global-rules-master-on"),
+        safeStorageGet("other-alerts-master-on"),
+        safeStorageGet("default-rule-pcts"),
       ]);
       if (wl) setWatchlist(wl);
       if (ca) setCustomAlerts(ca);
       if (ga) setGlobalAlerts(ga);
       if (re) setRulesEnabled(re);
       if (tf) setTriggered(tf);
+      if (grm !== null && grm !== undefined) setGlobalRulesMasterOn(grm);
+      if (oam !== null && oam !== undefined) setOtherAlertsMasterOn(oam);
+      if (drp) setDefaultRulePcts(drp);
       const st = await safeStorageGet("saved-trades");
       if (st) setSavedTrades(st);
       const savedTheme = await safeStorageGet("theme-mode");
@@ -607,13 +623,16 @@ export default function FuturesTracker() {
           custom_alerts: customAlerts,
           global_alerts: globalAlerts,
           saved_trades: savedTrades,
+          global_rules_master_on: globalRulesMasterOn,
+          other_alerts_master_on: otherAlertsMasterOn,
+          default_rule_pcts: defaultRulePcts,
           updated_at: new Date().toISOString(),
         });
       } catch {
         /* best effort — foreground alerts still work regardless */
       }
     },
-    [bgAlertsStatus, rulesEnabled, customAlerts, globalAlerts, savedTrades]
+    [bgAlertsStatus, rulesEnabled, customAlerts, globalAlerts, savedTrades, globalRulesMasterOn, otherAlertsMasterOn, defaultRulePcts]
   );
 
   // keep the server-side copy in sync whenever the alert config actually
@@ -621,7 +640,7 @@ export default function FuturesTracker() {
   useEffect(() => {
     if (bgAlertsStatus === "on") syncAlertConfigToServer();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bgAlertsStatus, rulesEnabled, customAlerts, globalAlerts, savedTrades]);
+  }, [bgAlertsStatus, rulesEnabled, customAlerts, globalAlerts, savedTrades, globalRulesMasterOn, otherAlertsMasterOn, defaultRulePcts]);
 
   // ---- persist on change (after initial load) ----
   useEffect(() => {
@@ -636,6 +655,15 @@ export default function FuturesTracker() {
   useEffect(() => {
     if (storageLoaded.current) safeStorageSet("rules-enabled", rulesEnabled);
   }, [rulesEnabled]);
+  useEffect(() => {
+    if (storageLoaded.current) safeStorageSet("global-rules-master-on", globalRulesMasterOn);
+  }, [globalRulesMasterOn]);
+  useEffect(() => {
+    if (storageLoaded.current) safeStorageSet("other-alerts-master-on", otherAlertsMasterOn);
+  }, [otherAlertsMasterOn]);
+  useEffect(() => {
+    if (storageLoaded.current) safeStorageSet("default-rule-pcts", defaultRulePcts);
+  }, [defaultRulePcts]);
   useEffect(() => {
     if (storageLoaded.current) safeStorageSet("triggered-feed", triggered.slice(0, 30));
   }, [triggered]);
@@ -876,43 +904,48 @@ export default function FuturesTracker() {
           active[key] = false;
         }
       };
-      rows.forEach((r) => {
-        const sym = r.symbol;
-        DEFAULT_RULES.forEach((rule) => {
-          if (!rulesEnabled[rule.min]) return;
-          const chg = changeFromBuffer(sym, rule.min);
-          if (chg === null) return;
-          const passes = Math.abs(chg) >= rule.pct;
-          checkEdge(`default:${rule.min}|${sym}`, passes, () =>
-            fireAlert("default:" + rule.min, sym, rule.min, rule.pct, chg)
-          );
-        });
-      });
-      customAlerts.forEach((a) => {
-        let chg = null;
-        if (a.min <= 60) {
-          chg = changeFromBuffer(a.symbol, a.min);
-        } else {
-          const dd = detailData[a.symbol];
-          chg = dd && dd.changes ? dd.changes[a.min] : null;
-        }
-        if (chg === null || !isFinite(chg)) return;
-        const passes =
-          a.dir === "either" ? Math.abs(chg) >= a.pct : a.dir === "up" ? chg >= a.pct : -chg >= a.pct;
-        checkEdge(`custom:${a.id}`, passes, () => fireAlert("custom:" + a.id, a.symbol, a.min, a.pct, chg));
-      });
-      globalAlerts.forEach((g) => {
+      if (globalRulesMasterOn) {
         rows.forEach((r) => {
-          const chg = changeFromBuffer(r.symbol, g.min);
+          const sym = r.symbol;
+          DEFAULT_RULES.forEach((rule) => {
+            if (!rulesEnabled[rule.min]) return;
+            const pct = defaultRulePcts[rule.min] ?? rule.pct;
+            const chg = changeFromBuffer(sym, rule.min);
+            if (chg === null) return;
+            const passes = Math.abs(chg) >= pct;
+            checkEdge(`default:${rule.min}|${sym}`, passes, () =>
+              fireAlert("default:" + rule.min, sym, rule.min, pct, chg)
+            );
+          });
+        });
+      }
+      if (otherAlertsMasterOn) {
+        customAlerts.forEach((a) => {
+          let chg = null;
+          if (a.min <= 60) {
+            chg = changeFromBuffer(a.symbol, a.min);
+          } else {
+            const dd = detailData[a.symbol];
+            chg = dd && dd.changes ? dd.changes[a.min] : null;
+          }
           if (chg === null || !isFinite(chg)) return;
           const passes =
-            g.dir === "either" ? Math.abs(chg) >= g.pct : g.dir === "up" ? chg >= g.pct : -chg >= g.pct;
-          checkEdge(`global:${g.id}|${r.symbol}`, passes, () => fireAlert("global:" + g.id, r.symbol, g.min, g.pct, chg));
+            a.dir === "either" ? Math.abs(chg) >= a.pct : a.dir === "up" ? chg >= a.pct : -chg >= a.pct;
+          checkEdge(`custom:${a.id}`, passes, () => fireAlert("custom:" + a.id, a.symbol, a.min, a.pct, chg));
         });
-      });
+        globalAlerts.forEach((g) => {
+          rows.forEach((r) => {
+            const chg = changeFromBuffer(r.symbol, g.min);
+            if (chg === null || !isFinite(chg)) return;
+            const passes =
+              g.dir === "either" ? Math.abs(chg) >= g.pct : g.dir === "up" ? chg >= g.pct : -chg >= g.pct;
+            checkEdge(`global:${g.id}|${r.symbol}`, passes, () => fireAlert("global:" + g.id, r.symbol, g.min, g.pct, chg));
+          });
+        });
+      }
     }, 5000);
     return () => clearInterval(id);
-  }, [rows, rulesEnabled, customAlerts, globalAlerts, detailData, changeFromBuffer, fireAlert]);
+  }, [rows, rulesEnabled, customAlerts, globalAlerts, detailData, changeFromBuffer, fireAlert, globalRulesMasterOn, otherAlertsMasterOn, defaultRulePcts]);
 
   // ---- saved trade PnL sign-flip + ROI%/PNL$ target notifications ----
   // ROI/PNL targets are edge-triggered both directions: fire once on
@@ -1538,6 +1571,12 @@ export default function FuturesTracker() {
           <AlertsPanel
             rulesEnabled={rulesEnabled}
             setRulesEnabled={setRulesEnabled}
+            globalRulesMasterOn={globalRulesMasterOn}
+            setGlobalRulesMasterOn={setGlobalRulesMasterOn}
+            otherAlertsMasterOn={otherAlertsMasterOn}
+            setOtherAlertsMasterOn={setOtherAlertsMasterOn}
+            defaultRulePcts={defaultRulePcts}
+            setDefaultRulePcts={setDefaultRulePcts}
             customAlerts={customAlerts}
             removeCustomAlert={removeCustomAlert}
             globalAlerts={globalAlerts}
@@ -2913,6 +2952,12 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
 function AlertsPanel({
   rulesEnabled,
   setRulesEnabled,
+  globalRulesMasterOn,
+  setGlobalRulesMasterOn,
+  otherAlertsMasterOn,
+  setOtherAlertsMasterOn,
+  defaultRulePcts,
+  setDefaultRulePcts,
   customAlerts,
   removeCustomAlert,
   globalAlerts,
@@ -3075,8 +3120,20 @@ function AlertsPanel({
         )}
       </div>
 
-      <SectionTitle>Global rules — apply to every pair</SectionTitle>
-      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 18 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+        <SectionTitle>Global rules — apply to every pair</SectionTitle>
+        <MasterToggle on={globalRulesMasterOn} onToggle={() => setGlobalRulesMasterOn((v) => !v)} />
+      </div>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 6,
+          marginBottom: 18,
+          opacity: globalRulesMasterOn ? 1 : 0.45,
+          pointerEvents: globalRulesMasterOn ? "auto" : "none",
+        }}
+      >
         {DEFAULT_RULES.map((rule) => (
           <label
             key={rule.min}
@@ -3096,16 +3153,49 @@ function AlertsPanel({
               checked={!!rulesEnabled[rule.min]}
               onChange={(e) => setRulesEnabled((r) => ({ ...r, [rule.min]: e.target.checked }))}
             />
-            Notify if any pair moves ±{rule.pct}% within {INTERVALS.find((i) => i.min === rule.min)?.label}
+            <span>
+              Notify if any pair moves ±
+              <input
+                type="number"
+                min="0.1"
+                step="0.1"
+                value={defaultRulePcts[rule.min] ?? rule.pct}
+                onChange={(e) =>
+                  setDefaultRulePcts((p) => ({ ...p, [rule.min]: Math.max(0.1, Number(e.target.value) || rule.pct) }))
+                }
+                style={{
+                  width: 52,
+                  margin: "0 4px",
+                  background: C.panelAlt,
+                  border: `1px solid ${C.border}`,
+                  borderRadius: 5,
+                  color: C.text,
+                  fontSize: 12.5,
+                  padding: "2px 5px",
+                  fontFamily: mono,
+                }}
+              />
+              % within {INTERVALS.find((i) => i.min === rule.min)?.label}
+            </span>
           </label>
         ))}
       </div>
 
-      <SectionTitle>Global alerts — any pair, your own threshold</SectionTitle>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+        <SectionTitle>Global alerts & custom alerts — any pair, your own threshold</SectionTitle>
+        <MasterToggle on={otherAlertsMasterOn} onToggle={() => setOtherAlertsMasterOn((v) => !v)} />
+      </div>
       <div style={{ fontSize: 11.5, color: C.textDim, marginBottom: 8, marginTop: -4 }}>
         Runs across every pair, checked by the background job once a minute. Any interval up to 24h — pick a preset or
-        choose Custom for anything else (e.g. 9h, 11h, 18h).
+        choose Custom for anything else (e.g. 9h, 11h, 18h). This switch covers both the Global alerts and Custom
+        alerts sections below.
       </div>
+      <div
+        style={{
+          opacity: otherAlertsMasterOn ? 1 : 0.45,
+          pointerEvents: otherAlertsMasterOn ? "auto" : "none",
+        }}
+      >
       <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
         {globalAlerts.length === 0 && (
           <div style={{ fontSize: 12.5, color: C.textDim }}>None yet.</div>
@@ -3264,6 +3354,7 @@ function AlertsPanel({
           + Add
         </button>
       </div>
+      </div>
 
       <SectionTitle>Recent triggers</SectionTitle>
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -3303,4 +3394,55 @@ function AlertsPanel({
 
 function SectionTitle({ children }) {
   return <div style={{ fontSize: 12.5, fontWeight: 600, color: C.text, marginBottom: 8 }}>{children}</div>;
+}
+
+// Small pill switch for a group of alert rules — on/off for the whole
+// section at once. Visually distinct from the per-rule checkboxes below it.
+function MasterToggle({ on, onToggle }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="ft-btn"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        background: on ? C.gainBg : C.panelAlt,
+        border: `1px solid ${on ? C.gain : C.border}`,
+        borderRadius: 999,
+        padding: "3px 10px 3px 4px",
+        fontSize: 10.5,
+        fontWeight: 700,
+        color: on ? C.gain : C.textDim,
+        flexShrink: 0,
+      }}
+    >
+      <span
+        style={{
+          width: 26,
+          height: 15,
+          borderRadius: 999,
+          background: on ? C.gain : C.border,
+          position: "relative",
+          display: "inline-block",
+          transition: "background 0.15s",
+        }}
+      >
+        <span
+          style={{
+            position: "absolute",
+            top: 2,
+            left: on ? 13 : 2,
+            width: 11,
+            height: 11,
+            borderRadius: "50%",
+            background: "#fff",
+            transition: "left 0.15s",
+          }}
+        />
+      </span>
+      {on ? "ON" : "OFF"}
+    </button>
+  );
 }
