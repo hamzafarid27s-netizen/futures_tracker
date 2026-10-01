@@ -359,6 +359,13 @@ export default function FuturesTracker() {
   const [taMap, setTaMap] = useState({});
   const [taBulkStatus, setTaBulkStatus] = useState("idle"); // idle | loading | done | blocked
   const [taBulkDone, setTaBulkDone] = useState(0);
+  // When Supabase is configured, the TA screener is computed server-side on
+  // a schedule (compute-ta Edge Function + pg_cron) so it keeps filling in
+  // and staying fresh even if this tab/app isn't open — taSyncedAt is the
+  // newest updated_at we've pulled, taServerCount how many pairs the server
+  // has scanned so far.
+  const [taSyncedAt, setTaSyncedAt] = useState(null);
+  const [taServerCount, setTaServerCount] = useState(0);
   const tradeSignRef = useRef({});
   // Edge-triggered "is this rule currently passing?" state, keyed by rule
   // key (+ symbol for price rules). Replaces cooldown-timer firing: a
@@ -540,6 +547,48 @@ export default function FuturesTracker() {
       }, waitMs);
     }
   };
+
+  // Pull the server-computed TA screener (compute-ta Edge Function, run on a
+  // pg_cron schedule) whenever Supabase is configured — this is what makes
+  // the screener keep scanning and completing in the background, since it
+  // runs on Supabase's schedule rather than needing this tab open. Falls
+  // back to the client-side startTaBulk() above when Supabase isn't set up.
+  useEffect(() => {
+    if (!isBackgroundAlertsConfigured() || !supabase) return;
+    let cancelled = false;
+    const loadServerTa = async () => {
+      const { data, error } = await supabase.from("ta_screener").select("*");
+      if (cancelled || error || !data) return;
+      const map = {};
+      let latest = 0;
+      data.forEach((r) => {
+        map[r.symbol] = {
+          trend: r.trend,
+          trendStrength: r.trend_strength,
+          adx: r.adx,
+          momentum: r.momentum,
+          rsi: r.rsi,
+          support: r.support,
+          resistance: r.resistance,
+          nearSupportPct: r.near_support_pct,
+          nearResistancePct: r.near_resistance_pct,
+          reversal: r.reversal,
+          price: r.price,
+          updatedAt: new Date(r.updated_at).getTime(),
+        };
+        latest = Math.max(latest, new Date(r.updated_at).getTime());
+      });
+      setTaMap(map);
+      setTaServerCount(data.length);
+      setTaSyncedAt(latest || null);
+    };
+    loadServerTa();
+    const id = setInterval(loadServerTa, 60000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
 
   const toggleAthFilter = (mode) => {
     setAthFilterMode((cur) => (cur === mode ? "none" : mode));
@@ -1650,6 +1699,9 @@ export default function FuturesTracker() {
             taBulkStatus={taBulkStatus}
             taBulkDone={taBulkDone}
             startTaBulk={startTaBulk}
+            serverMode={isBackgroundAlertsConfigured()}
+            taSyncedAt={taSyncedAt}
+            taServerCount={taServerCount}
             logos={coinLogos}
           />
         )}
@@ -2219,8 +2271,10 @@ async function fetchTAForSymbol(symbol) {
   }
 
   const { support, resistance } = swingLevels(highs, lows, 60);
-  const nearRes = resistance ? ((resistance - last) / last) * 100 : null; // % above price
-  const nearSup = support ? ((last - support) / last) * 100 : null; // % below price
+  // Absolute distance either direction — price can sit just above OR just
+  // below a level (briefly poking through it) and still be "near" it.
+  const nearRes = resistance ? (Math.abs(resistance - last) / last) * 100 : null;
+  const nearSup = support ? (Math.abs(last - support) / last) * 100 : null;
 
   // Reversal: RSI at an extreme while price sits close to the level that
   // would make that extreme meaningful (overbought near resistance in an
@@ -3252,16 +3306,48 @@ function reversalTone(r) {
   return "neutral";
 }
 
-function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, logos }) {
+// How close price has to be to a support/resistance level (either side) to
+// count as "near" it for the Support/Resistance filter buttons — same 5%
+// convention used by the Market tab's Near ATH/ATL filters.
+const NEAR_LEVEL_PCT = 5;
+
+function agoLabel(ms) {
+  if (!ms) return null;
+  const sec = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  return `${hr}h ago`;
+}
+
+function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, serverMode, taSyncedAt, taServerCount, logos }) {
   const [query, setQuery] = useState("");
   const [trendFilter, setTrendFilter] = useState("all"); // all | Up | Down | Sideways
+  const [levelFilter, setLevelFilter] = useState("none"); // none | support | resistance | reversal
   const [sortKey, setSortKey] = useState("volume"); // volume | rsi | adx
-  const scanned = Object.keys(taMap).length;
+  const scanned = serverMode ? taServerCount : Object.keys(taMap).length;
 
   const sorted = useMemo(() => {
     let list = rows.filter((r) => r.symbol.toLowerCase().includes(query.trim().toLowerCase()));
     if (trendFilter !== "all") {
       list = list.filter((r) => taMap[r.symbol]?.trend === trendFilter);
+    }
+    if (levelFilter === "support") {
+      list = list.filter((r) => {
+        const t = taMap[r.symbol];
+        return t && t.nearSupportPct != null && t.nearSupportPct <= NEAR_LEVEL_PCT;
+      });
+    } else if (levelFilter === "resistance") {
+      list = list.filter((r) => {
+        const t = taMap[r.symbol];
+        return t && t.nearResistancePct != null && t.nearResistancePct <= NEAR_LEVEL_PCT;
+      });
+    } else if (levelFilter === "reversal") {
+      list = list.filter((r) => {
+        const t = taMap[r.symbol];
+        return t && t.reversal && t.reversal !== "None";
+      });
     }
     list = [...list];
     if (sortKey === "rsi") {
@@ -3272,11 +3358,30 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
       list.sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume));
     }
     return list;
-  }, [rows, taMap, query, trendFilter, sortKey]);
+  }, [rows, taMap, query, trendFilter, levelFilter, sortKey]);
+
+  const levelBtn = (key, label) => (
+    <button
+      className="ft-btn"
+      onClick={() => setLevelFilter((cur) => (cur === key ? "none" : key))}
+      style={{
+        background: levelFilter === key ? C.amber : C.panel,
+        color: levelFilter === key ? "#1A1300" : C.textMuted,
+        border: `1px solid ${levelFilter === key ? C.amber : C.border}`,
+        borderRadius: 8,
+        padding: "9px 14px",
+        fontSize: 12.5,
+        fontWeight: 600,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {label}
+    </button>
+  );
 
   return (
     <>
-      <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
+      <div style={{ display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
         <input
           className="ft-input"
           value={query}
@@ -3332,27 +3437,38 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
           <option value="rsi">Sort: RSI</option>
           <option value="adx">Sort: Trend strength</option>
         </select>
-        <button
-          className="ft-btn"
-          onClick={startTaBulk}
-          disabled={taBulkStatus === "loading"}
-          style={{
-            background: C.panelRaised,
-            color: C.text,
-            border: `1px solid ${C.borderLight}`,
-            borderRadius: 8,
-            padding: "9px 14px",
-            fontSize: 12.5,
-            fontWeight: 700,
-            whiteSpace: "nowrap",
-            opacity: taBulkStatus === "loading" ? 0.6 : 1,
-          }}
-        >
-          {taBulkStatus === "loading" ? `Scanning… ${taBulkDone}/${rows.length}` : scanned > 0 ? "Rescan" : "Run scan"}
-        </button>
+        {!serverMode && (
+          <button
+            className="ft-btn"
+            onClick={startTaBulk}
+            disabled={taBulkStatus === "loading"}
+            style={{
+              background: C.panelRaised,
+              color: C.text,
+              border: `1px solid ${C.borderLight}`,
+              borderRadius: 8,
+              padding: "9px 14px",
+              fontSize: 12.5,
+              fontWeight: 700,
+              whiteSpace: "nowrap",
+              opacity: taBulkStatus === "loading" ? 0.6 : 1,
+            }}
+          >
+            {taBulkStatus === "loading" ? `Scanning… ${taBulkDone}/${rows.length}` : scanned > 0 ? "Rescan" : "Run scan"}
+          </button>
+        )}
       </div>
 
-      {taBulkStatus === "blocked" && (
+      <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <span style={{ fontSize: 10.5, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em" }}>
+          Near a level:
+        </span>
+        {levelBtn("support", "Support")}
+        {levelBtn("resistance", "Resistance")}
+        {levelBtn("reversal", "Reversal")}
+      </div>
+
+      {!serverMode && taBulkStatus === "blocked" && (
         <div
           style={{
             background: C.lossBg,
@@ -3368,10 +3484,18 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
         </div>
       )}
 
-      {scanned === 0 && taBulkStatus !== "loading" && (
+      {!serverMode && scanned === 0 && taBulkStatus !== "loading" && (
         <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 12 }}>
           Run a scan to classify every pair's trend, strength, momentum, support/resistance and reversal signal from
-          official Binance 4h candles.
+          official Binance 4h candles. This runs in this tab only — background alerts aren't configured, so it won't
+          keep scanning once you leave.
+        </div>
+      )}
+
+      {serverMode && scanned === 0 && (
+        <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 12 }}>
+          The background scanner is filling this in now — it runs on a schedule server-side, so it keeps scanning and
+          stays current even when this app isn't open. Check back in a minute.
         </div>
       )}
 
@@ -3380,6 +3504,7 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
           <thead>
             <tr style={{ textAlign: "left", color: C.textMuted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.3 }}>
               <th style={{ padding: "6px 8px" }}>Pair</th>
+              <th style={{ padding: "6px 8px" }}>Price</th>
               <th style={{ padding: "6px 8px" }}>Trend</th>
               <th style={{ padding: "6px 8px" }}>Strength</th>
               <th style={{ padding: "6px 8px" }}>Momentum</th>
@@ -3391,6 +3516,7 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
           <tbody>
             {sorted.map((r) => {
               const t = taMap[r.symbol];
+              const price = parseFloat(r.lastPrice);
               return (
                 <tr key={r.symbol} className="ft-row" style={{ borderBottom: `1px solid ${C.border}` }}>
                   <td style={{ padding: "8px 8px" }}>
@@ -3399,9 +3525,12 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
                       <span style={{ fontWeight: 600, color: C.text }}>{r.symbol.replace("USDT", "")}</span>
                     </div>
                   </td>
+                  <td style={{ padding: "8px 8px", fontFamily: mono, color: C.text }}>
+                    {isFinite(price) ? fmtPrice(price) : "—"}
+                  </td>
                   {!t ? (
                     <td colSpan={6} style={{ padding: "8px 8px", color: C.textDim, fontFamily: mono, fontSize: 11.5 }}>
-                      {taBulkStatus === "loading" ? "scanning…" : "not scanned yet"}
+                      {taBulkStatus === "loading" || serverMode ? "scanning…" : "not scanned yet"}
                     </td>
                   ) : (
                     <>
@@ -3428,7 +3557,7 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
                         {t.support != null ? t.support.toPrecision(6) : "—"}
                         {t.nearSupportPct != null && (
                           <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>
-                            (-{t.nearSupportPct.toFixed(1)}%)
+                            ({t.nearSupportPct.toFixed(1)}%)
                           </span>
                         )}
                       </td>
@@ -3436,7 +3565,7 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
                         {t.resistance != null ? t.resistance.toPrecision(6) : "—"}
                         {t.nearResistancePct != null && (
                           <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>
-                            (+{t.nearResistancePct.toFixed(1)}%)
+                            ({t.nearResistancePct.toFixed(1)}%)
                           </span>
                         )}
                       </td>
@@ -3453,7 +3582,11 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, log
       </div>
       <div style={{ marginTop: 8, fontSize: 11, color: C.textDim, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
         <span>{sorted.length} of {rows.length || "…"} pairs · {scanned} scanned</span>
-        <span>Based on official Binance 4h candles · EMA20/50, RSI14, ADX14, 60-candle swing levels</span>
+        <span>
+          {serverMode
+            ? `Scanned server-side${taSyncedAt ? ` · newest ${agoLabel(taSyncedAt)}` : ""} · EMA20/50, RSI14, ADX14, 60-candle swing levels`
+            : "Based on official Binance 4h candles · EMA20/50, RSI14, ADX14, 60-candle swing levels"}
+        </span>
       </div>
     </>
   );
