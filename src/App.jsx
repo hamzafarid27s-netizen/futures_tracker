@@ -350,6 +350,11 @@ export default function FuturesTracker() {
   const [athAtlMap, setAthAtlMap] = useState({}); // symbol -> {ath, athTime, atl, atlTime, ...} (1d)
   const [athAtlBulkStatus, setAthAtlBulkStatus] = useState("idle"); // idle | loading | done
   const [athAtlBulkDone, setAthAtlBulkDone] = useState(0);
+  // Screener's per-pair, on-demand 1h ATH/ATL — unlike the bulk 1d scan
+  // above, this only computes for a pair once the user actually clicks it.
+  // symbol -> { status: "loading"|"done"|"error", progress, ath, atl, ... }
+  const [screenerAthAtl, setScreenerAthAtl] = useState({});
+  const screenerAthAtlRunning = useRef(new Set());
   const [athFilterMode, setAthFilterMode] = useState("none"); // none | ath | atl
   const [extChangeMap, setExtChangeMap] = useState({}); // symbol -> {"120":pct, "240":pct, "480":pct, "720":pct}
   const [extChangeBulkStatus, setExtChangeBulkStatus] = useState("idle"); // idle | loading | done | blocked
@@ -416,6 +421,14 @@ export default function FuturesTracker() {
           if (key.endsWith("|1d")) map[key.slice(0, -3)] = val;
         });
         setAthAtlMap(map);
+        // Screener's per-pair 1h ATH/ATL shares the same cache store (keyed
+        // "<symbol>|1h") as Analyze's precision toggle, so a pair scanned in
+        // either place shows up already-done in the other.
+        const map1h = {};
+        Object.entries(athCache).forEach(([key, val]) => {
+          if (key.endsWith("|1h")) map1h[key.slice(0, -3)] = { status: "done", ...val };
+        });
+        setScreenerAthAtl(map1h);
       }
       const extCache = await safeStorageGet("ext-change-cache");
       if (extCache) {
@@ -588,6 +601,31 @@ export default function FuturesTracker() {
       cancelled = true;
       clearInterval(id);
     };
+  }, []);
+
+  // Scans ONE pair's true all-time high/low from 1h candles, kicked off by
+  // tapping its ATH or ATL cell in the Screener — no bulk pass, since 1h
+  // history goes back to the Binance Futures launch and is much heavier per
+  // symbol than the 1d bulk scan above.
+  const scanScreenerAthAtl = useCallback(async (symbol) => {
+    if (screenerAthAtlRunning.current.has(symbol)) return;
+    screenerAthAtlRunning.current.add(symbol);
+    setScreenerAthAtl((m) => ({ ...m, [symbol]: { status: "loading", progress: null } }));
+    try {
+      const cacheMap = (await safeStorageGet("ath-atl-cache")) || {};
+      const key = symbol + "|1h";
+      const cached = cacheMap[key];
+      const result = await fetchTrueAthAtl(symbol, "1h", cached, (p) =>
+        setScreenerAthAtl((m) => ({ ...m, [symbol]: { status: "loading", progress: p.batch } }))
+      );
+      cacheMap[key] = { interval: "1h", ...result };
+      await safeStorageSet("ath-atl-cache", cacheMap);
+      setScreenerAthAtl((m) => ({ ...m, [symbol]: { status: "done", ...result } }));
+    } catch (e) {
+      setScreenerAthAtl((m) => ({ ...m, [symbol]: { status: "error", error: e.message || "failed" } }));
+    } finally {
+      screenerAthAtlRunning.current.delete(symbol);
+    }
   }, []);
 
   const toggleAthFilter = (mode) => {
@@ -1702,6 +1740,8 @@ export default function FuturesTracker() {
             serverMode={isBackgroundAlertsConfigured()}
             taSyncedAt={taSyncedAt}
             taServerCount={taServerCount}
+            screenerAthAtl={screenerAthAtl}
+            scanScreenerAthAtl={scanScreenerAthAtl}
             logos={coinLogos}
           />
         )}
@@ -3321,44 +3361,144 @@ function agoLabel(ms) {
   return `${hr}h ago`;
 }
 
-function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, serverMode, taSyncedAt, taServerCount, logos }) {
+function ScreenerPanel({
+  rows,
+  taMap,
+  taBulkStatus,
+  taBulkDone,
+  startTaBulk,
+  serverMode,
+  taSyncedAt,
+  taServerCount,
+  screenerAthAtl,
+  scanScreenerAthAtl,
+  logos,
+}) {
   const [query, setQuery] = useState("");
   const [trendFilter, setTrendFilter] = useState("all"); // all | Up | Down | Sideways
   const [levelFilter, setLevelFilter] = useState("none"); // none | support | resistance | reversal
   const [sortKey, setSortKey] = useState("volume"); // volume | rsi | adx
   const scanned = serverMode ? taServerCount : Object.keys(taMap).length;
 
+  // A pair the background/bulk scan hasn't reached yet gets scanned
+  // on-demand the moment a search narrows down to it, instead of just
+  // sitting there saying "scanning…" until its turn eventually comes up.
+  // Capped to a handful of matches so a broad query doesn't trigger a pile
+  // of individual scans.
+  const [onDemandMap, setOnDemandMap] = useState({});
+  const onDemandRunning = useRef(new Set());
+  useEffect(() => {
+    const q = query.trim().toLowerCase();
+    if (q.length < 2) return;
+    const matches = rows.filter((r) => r.symbol.toLowerCase().includes(q));
+    if (matches.length === 0 || matches.length > 6) return;
+    matches.forEach((r) => {
+      const sym = r.symbol;
+      if (taMap[sym] || onDemandMap[sym] || onDemandRunning.current.has(sym)) return;
+      onDemandRunning.current.add(sym);
+      fetchTAForSymbol(sym)
+        .then((result) => setOnDemandMap((m) => ({ ...m, [sym]: result })))
+        .catch(() => {})
+        .finally(() => onDemandRunning.current.delete(sym));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, rows, taMap]);
+  const effectiveTaMap = useMemo(() => ({ ...onDemandMap, ...taMap }), [onDemandMap, taMap]);
+
   const sorted = useMemo(() => {
     let list = rows.filter((r) => r.symbol.toLowerCase().includes(query.trim().toLowerCase()));
     if (trendFilter !== "all") {
-      list = list.filter((r) => taMap[r.symbol]?.trend === trendFilter);
+      list = list.filter((r) => effectiveTaMap[r.symbol]?.trend === trendFilter);
     }
     if (levelFilter === "support") {
       list = list.filter((r) => {
-        const t = taMap[r.symbol];
+        const t = effectiveTaMap[r.symbol];
         return t && t.nearSupportPct != null && t.nearSupportPct <= NEAR_LEVEL_PCT;
       });
     } else if (levelFilter === "resistance") {
       list = list.filter((r) => {
-        const t = taMap[r.symbol];
+        const t = effectiveTaMap[r.symbol];
         return t && t.nearResistancePct != null && t.nearResistancePct <= NEAR_LEVEL_PCT;
       });
     } else if (levelFilter === "reversal") {
       list = list.filter((r) => {
-        const t = taMap[r.symbol];
+        const t = effectiveTaMap[r.symbol];
         return t && t.reversal && t.reversal !== "None";
       });
     }
     list = [...list];
     if (sortKey === "rsi") {
-      list.sort((a, b) => (taMap[b.symbol]?.rsi ?? -1) - (taMap[a.symbol]?.rsi ?? -1));
+      list.sort((a, b) => (effectiveTaMap[b.symbol]?.rsi ?? -1) - (effectiveTaMap[a.symbol]?.rsi ?? -1));
     } else if (sortKey === "adx") {
-      list.sort((a, b) => (taMap[b.symbol]?.adx ?? -1) - (taMap[a.symbol]?.adx ?? -1));
+      list.sort((a, b) => (effectiveTaMap[b.symbol]?.adx ?? -1) - (effectiveTaMap[a.symbol]?.adx ?? -1));
     } else {
       list.sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume));
     }
     return list;
-  }, [rows, taMap, query, trendFilter, levelFilter, sortKey]);
+  }, [rows, effectiveTaMap, query, trendFilter, levelFilter, sortKey]);
+
+  // One ATH/ATL cell — shows the cached value (tap to rescan), a spinner
+  // with batch progress while it's running, or a "Scan" button to kick it
+  // off. ATH and ATL always come from the same single scan.
+  const athAtlCell = (r, field) => {
+    const entry = screenerAthAtl[r.symbol];
+    if (entry?.status === "done") {
+      return (
+        <button
+          className="ft-btn"
+          onClick={() => scanScreenerAthAtl(r.symbol)}
+          title="Tap to rescan"
+          style={{
+            fontFamily: mono,
+            fontSize: 12,
+            fontWeight: 600,
+            color: field === "ath" ? C.gain : C.loss,
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            cursor: "pointer",
+          }}
+        >
+          {fmtPrice(entry[field])}
+        </button>
+      );
+    }
+    if (entry?.status === "loading") {
+      return (
+        <span style={{ fontSize: 11, color: C.textDim, fontFamily: mono }}>
+          {entry.progress ? `scanning (${entry.progress})…` : "scanning…"}
+        </span>
+      );
+    }
+    if (entry?.status === "error") {
+      return (
+        <button
+          className="ft-btn"
+          onClick={() => scanScreenerAthAtl(r.symbol)}
+          style={{ fontSize: 11, color: C.loss, background: "transparent", border: `1px solid ${C.loss}`, borderRadius: 6, padding: "3px 8px" }}
+        >
+          retry
+        </button>
+      );
+    }
+    return (
+      <button
+        className="ft-btn"
+        onClick={() => scanScreenerAthAtl(r.symbol)}
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          color: C.textMuted,
+          background: C.panelAlt,
+          border: `1px solid ${C.border}`,
+          borderRadius: 6,
+          padding: "4px 9px",
+        }}
+      >
+        Scan
+      </button>
+    );
+  };
 
   const levelBtn = (key, label) => (
     <button
@@ -3511,11 +3651,13 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, ser
               <th style={{ padding: "6px 8px" }}>Support</th>
               <th style={{ padding: "6px 8px" }}>Resistance</th>
               <th style={{ padding: "6px 8px" }}>Reversal</th>
+              <th style={{ padding: "6px 8px" }}>ATH (1h)</th>
+              <th style={{ padding: "6px 8px" }}>ATL (1h)</th>
             </tr>
           </thead>
           <tbody>
             {sorted.map((r) => {
-              const t = taMap[r.symbol];
+              const t = effectiveTaMap[r.symbol];
               const price = parseFloat(r.lastPrice);
               return (
                 <tr key={r.symbol} className="ft-row" style={{ borderBottom: `1px solid ${C.border}` }}>
@@ -3530,7 +3672,7 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, ser
                   </td>
                   {!t ? (
                     <td colSpan={6} style={{ padding: "8px 8px", color: C.textDim, fontFamily: mono, fontSize: 11.5 }}>
-                      {taBulkStatus === "loading" || serverMode ? "scanning…" : "not scanned yet"}
+                      scanning…
                     </td>
                   ) : (
                     <>
@@ -3574,6 +3716,8 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, ser
                       </td>
                     </>
                   )}
+                  <td style={{ padding: "8px 8px" }}>{athAtlCell(r, "ath")}</td>
+                  <td style={{ padding: "8px 8px" }}>{athAtlCell(r, "atl")}</td>
                 </tr>
               );
             })}
@@ -3586,6 +3730,7 @@ function ScreenerPanel({ rows, taMap, taBulkStatus, taBulkDone, startTaBulk, ser
           {serverMode
             ? `Scanned server-side${taSyncedAt ? ` · newest ${agoLabel(taSyncedAt)}` : ""} · EMA20/50, RSI14, ADX14, 60-candle swing levels`
             : "Based on official Binance 4h candles · EMA20/50, RSI14, ADX14, 60-candle swing levels"}
+          {" · tap ATH/ATL to scan a pair's true 1h all-time high/low"}
         </span>
       </div>
     </>
