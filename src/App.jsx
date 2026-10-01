@@ -3443,23 +3443,30 @@ function ScreenerPanel({
   const athAtlCell = (r, field) => {
     const entry = screenerAthAtl[r.symbol];
     if (entry?.status === "done") {
+      const timeField = field === "ath" ? "athTime" : "atlTime";
       return (
         <button
           className="ft-btn"
           onClick={() => scanScreenerAthAtl(r.symbol)}
           title="Tap to rescan"
           style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-start",
+            gap: 1,
             fontFamily: mono,
-            fontSize: 12,
-            fontWeight: 600,
-            color: field === "ath" ? C.gain : C.loss,
             background: "transparent",
             border: "none",
             padding: 0,
             cursor: "pointer",
           }}
         >
-          {fmtPrice(entry[field])}
+          <span style={{ fontSize: 12, fontWeight: 600, color: field === "ath" ? C.gain : C.loss }}>
+            {fmtPrice(entry[field])}
+          </span>
+          <span style={{ fontSize: 10, color: C.textDim }}>
+            {entry[timeField] ? new Date(entry[timeField]).toISOString().slice(0, 10) : "—"}
+          </span>
         </button>
       );
     }
