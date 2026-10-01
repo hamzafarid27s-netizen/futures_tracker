@@ -2564,9 +2564,15 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
             remove
           </span>
         </div>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}>
-          <span style={{ color: pctColor(pnl), fontWeight: 700 }}>{pnl !== null ? (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + " USDT" : "—"}</span>
-          <span style={{ color: pctColor(roi), fontWeight: 700 }}>{fmtPct(roi)}</span>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
+          <div>
+            <div style={{ color: C.textDim, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 3 }}>PNL</div>
+            <span style={{ color: pctColor(pnl), fontWeight: 700 }}>{pnl !== null ? (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + " USDT" : "—"}</span>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ color: C.textDim, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 3 }}>ROI%</div>
+            <span style={{ color: pctColor(roi), fontWeight: 700 }}>{fmtPct(roi)}</span>
+          </div>
         </div>
       </div>
       <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px" }}>
