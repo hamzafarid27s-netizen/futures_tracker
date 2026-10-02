@@ -2586,6 +2586,9 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
   const [loading, setLoading] = useState(false);
   const [roiInput, setRoiInput] = useState("");
   const [pnlInput, setPnlInput] = useState("");
+  const [ta, setTa] = useState(null);
+  const [taLoading, setTaLoading] = useState(false);
+  const [oi, setOi] = useState(null);
 
   const cur = row ? parseFloat(row.lastPrice) : null;
   const sizeU = t.margin * t.leverage;
@@ -2623,6 +2626,34 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
         if (!cancelled) setAthAtl(null);
       } finally {
         if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [t.symbol]);
+
+  // Trend / strength / momentum / support / resistance / reversal, plus
+  // open interest — same read the Analyze tab and Screener use, scoped to
+  // this tracked pair.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setTaLoading(true);
+      try {
+        const data = await fetchTAForSymbol(t.symbol);
+        if (!cancelled) setTa(data);
+      } catch {
+        if (!cancelled) setTa(null);
+      } finally {
+        if (!cancelled) setTaLoading(false);
+      }
+      try {
+        const res = await fapiFetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${t.symbol}`);
+        const data = res.ok ? await res.json() : null;
+        if (!cancelled) setOi(data ? parseFloat(data.openInterest) : null);
+      } catch {
+        if (!cancelled) setOi(null);
       }
     })();
     return () => {
@@ -2703,6 +2734,14 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
               / <FundingCountdown nextFundingTime={funding[t.symbol]?.nextFundingTime} />
             </>
           )}
+          {statBox("24h Volume", row ? fmtCompact(parseFloat(row.quoteVolume)) + " USDT" : "—")}
+          {statBox("Open Interest", taLoading && oi === null ? "…" : oi !== null ? fmtCompact(oi) : "—")}
+          {statBox("Trend", taLoading ? "…" : ta ? <TaBadge text={ta.trend} tone={trendTone(ta.trend)} /> : "—")}
+          {statBox("Strength", taLoading ? "…" : ta ? <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} /> : "—")}
+          {statBox("Momentum", taLoading ? "…" : ta ? <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} /> : "—")}
+          {statBox("Reversal", taLoading ? "…" : ta ? <TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} /> : "—")}
+          {statBox("Support", taLoading ? "…" : ta?.support ? fmtPrice(ta.support) : "—")}
+          {statBox("Resistance", taLoading ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—")}
           {statBox("All Time High", loading ? "…" : athAtl ? fmtPrice(athAtl.ath) : "—", C.gain)}
           {statBox("All Time Low", loading ? "…" : athAtl ? fmtPrice(athAtl.atl) : "—", C.loss)}
         </div>
@@ -2789,6 +2828,8 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
   const [athAtlInterval, setAthAtlInterval] = useState("1d");
   const [athAtlError, setAthAtlError] = useState(null);
   const [error, setError] = useState(null);
+  const [ta, setTa] = useState(null);
+  const [taStatus, setTaStatus] = useState("idle"); // idle | loading | live | error
 
   const matchedRow = useMemo(() => {
     const sym = form.symbol.trim().toUpperCase();
@@ -2842,6 +2883,33 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
       .catch(() => {
         if (cancelled) return;
         setExtrasStatus("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matchedRow?.symbol]);
+
+  // Trend / strength / momentum / support / resistance / reversal — the
+  // same 4h-candle read used by the Screener tab, for whichever pair is
+  // picked here.
+  useEffect(() => {
+    if (!matchedRow) {
+      setTa(null);
+      setTaStatus("idle");
+      return;
+    }
+    let cancelled = false;
+    setTaStatus("loading");
+    fetchTAForSymbol(matchedRow.symbol)
+      .then((data) => {
+        if (cancelled) return;
+        setTa(data);
+        setTaStatus("live");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setTaStatus("error");
       });
     return () => {
       cancelled = true;
@@ -3194,6 +3262,39 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
                 {fmtPrice(parseFloat(matchedRow.highPrice))} / {fmtPrice(parseFloat(matchedRow.lowPrice))}
               </div>
             </div>
+          </div>
+        </Card>
+      )}
+
+      {matchedRow && (
+        <Card title="Volume, OI & Technicals">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 14, columnGap: 10 }}>
+            <Stat label="24h Volume" value={fmtCompact(parseFloat(matchedRow.quoteVolume)) + " USDT"} />
+            <Stat
+              label="Open Interest"
+              value={
+                extrasStatus === "loading"
+                  ? "…"
+                  : extras?.multiExchange?.binance?.oi != null
+                  ? fmtCompact(extras.multiExchange.binance.oi)
+                  : "—"
+              }
+            />
+            <Stat label="Trend" value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.trend} tone={trendTone(ta.trend)} /> : "—"} />
+            <Stat
+              label="Strength"
+              value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} /> : "—"}
+            />
+            <Stat
+              label="Momentum"
+              value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} /> : "—"}
+            />
+            <Stat
+              label="Reversal"
+              value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} /> : "—"}
+            />
+            <Stat label="Support" value={taStatus === "loading" ? "…" : ta?.support ? fmtPrice(ta.support) : "—"} />
+            <Stat label="Resistance" value={taStatus === "loading" ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—"} />
           </div>
         </Card>
       )}
