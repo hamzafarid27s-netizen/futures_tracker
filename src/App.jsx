@@ -2589,6 +2589,9 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
   const [ta, setTa] = useState(null);
   const [taLoading, setTaLoading] = useState(false);
   const [oi, setOi] = useState(null);
+  const [showHelp, setShowHelp] = useState(false);
+  const [showRoiAlerts, setShowRoiAlerts] = useState(false);
+  const [showPnlAlerts, setShowPnlAlerts] = useState(false);
 
   const cur = row ? parseFloat(row.lastPrice) : null;
   const sizeU = t.margin * t.leverage;
@@ -2737,93 +2740,152 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
           {statBox("24h Volume", row ? fmtCompact(parseFloat(row.quoteVolume)) + " USDT" : "—")}
           {statBox("Open Interest", taLoading && oi === null ? "…" : oi !== null ? fmtCompact(oi) : "—")}
           {statBox("Trend", taLoading ? "…" : ta ? <TaBadge text={ta.trend} tone={trendTone(ta.trend)} /> : "—")}
-          {statBox("Strength", taLoading ? "…" : ta ? <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} /> : "—")}
-          {statBox("Momentum", taLoading ? "…" : ta ? <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} /> : "—")}
+          {statBox(
+            "Strength",
+            taLoading ? (
+              "…"
+            ) : ta ? (
+              <>
+                <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} />
+                {ta.adx !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>ADX {ta.adx.toFixed(0)}</span>}
+              </>
+            ) : (
+              "—"
+            )
+          )}
+          {statBox(
+            "Momentum",
+            taLoading ? (
+              "…"
+            ) : ta ? (
+              <>
+                <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} />
+                {ta.rsi !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>RSI {ta.rsi.toFixed(0)}</span>}
+              </>
+            ) : (
+              "—"
+            )
+          )}
           {statBox("Reversal", taLoading ? "…" : ta ? <TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} /> : "—")}
           {statBox("Support", taLoading ? "…" : ta?.support ? fmtPrice(ta.support) : "—")}
           {statBox("Resistance", taLoading ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—")}
           {statBox("All Time High", loading ? "…" : athAtl ? fmtPrice(athAtl.ath) : "—", C.gain)}
           {statBox("All Time Low", loading ? "…" : athAtl ? fmtPrice(athAtl.atl) : "—", C.loss)}
         </div>
-        <TaConditionsNote />
 
         <div
+          onClick={() => setShowHelp((v) => !v)}
+          className="ft-btn"
+          style={{ fontSize: 11, color: C.textMuted, marginBottom: showHelp ? 8 : 14, display: "flex", alignItems: "center", gap: 4 }}
+        >
+          <span>{showHelp ? "▾" : "▸"}</span> How these are worked out
+        </div>
+        {showHelp && <TaConditionsNote />}
+
+        <div
+          onClick={() => setShowRoiAlerts((v) => !v)}
+          className="ft-btn"
           style={{
             fontSize: 10.5,
             fontWeight: 700,
             color: C.textDim,
             textTransform: "uppercase",
             letterSpacing: "0.03em",
-            marginBottom: 6,
+            marginBottom: showRoiAlerts ? 6 : 0,
             marginTop: 14,
+            display: "flex",
+            alignItems: "center",
+            gap: 5,
           }}
         >
-          ROI% target alerts
+          <span>{showRoiAlerts ? "▾" : "▸"}</span> ROI% target alerts {roiAlerts.length > 0 ? `(${roiAlerts.length})` : ""}
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
-          {roiAlerts.length === 0 && <div style={{ fontSize: 11.5, color: C.textDim }}>None yet.</div>}
-          {roiAlerts.map((a) => (
-            <div
-              key={a.id}
-              style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 10px", fontSize: 12, fontFamily: mono }}
-            >
-              <span>Notify when ROI {a.pct >= 0 ? "reaches +" : "drops to "}{a.pct}%</span>
-              <span onClick={() => onRemoveRoiAlert(t.id, a.id)} className="ft-btn" style={{ color: C.loss }}>
-                remove
-              </span>
+        {showRoiAlerts && (
+          <>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
+              {roiAlerts.length === 0 && <div style={{ fontSize: 11.5, color: C.textDim }}>None yet.</div>}
+              {roiAlerts.map((a) => (
+                <div
+                  key={a.id}
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 10px", fontSize: 12, fontFamily: mono }}
+                >
+                  <span>Notify when ROI {a.pct >= 0 ? "reaches +" : "drops to "}{a.pct}%</span>
+                  <span onClick={() => onRemoveRoiAlert(t.id, a.id)} className="ft-btn" style={{ color: C.loss }}>
+                    remove
+                  </span>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-        <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-          <input
-            type="number"
-            value={roiInput}
-            onChange={(e) => setRoiInput(e.target.value)}
-            placeholder="e.g. 25% or -15%"
-            style={{ ...selStyle(), width: 130 }}
-          />
-          <button
-            onClick={submitRoiAlert}
-            className="ft-btn"
-            style={{ background: C.amber, color: "#1A1300", border: "none", borderRadius: 6, padding: "6px 14px", fontSize: 12, fontWeight: 700 }}
-          >
-            + Add
-          </button>
-        </div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+              <input
+                type="number"
+                value={roiInput}
+                onChange={(e) => setRoiInput(e.target.value)}
+                placeholder="e.g. 25% or -15%"
+                style={{ ...selStyle(), width: 130 }}
+              />
+              <button
+                onClick={submitRoiAlert}
+                className="ft-btn"
+                style={{ background: C.amber, color: "#1A1300", border: "none", borderRadius: 6, padding: "6px 14px", fontSize: 12, fontWeight: 700 }}
+              >
+                + Add
+              </button>
+            </div>
+          </>
+        )}
 
-        <div style={{ fontSize: 10.5, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6 }}>
-          PNL (USDT) target alerts
+        <div
+          onClick={() => setShowPnlAlerts((v) => !v)}
+          className="ft-btn"
+          style={{
+            fontSize: 10.5,
+            fontWeight: 700,
+            color: C.textDim,
+            textTransform: "uppercase",
+            letterSpacing: "0.03em",
+            marginBottom: showPnlAlerts ? 6 : 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 5,
+          }}
+        >
+          <span>{showPnlAlerts ? "▾" : "▸"}</span> PNL (USDT) target alerts {pnlAlerts.length > 0 ? `(${pnlAlerts.length})` : ""}
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
-          {pnlAlerts.length === 0 && <div style={{ fontSize: 11.5, color: C.textDim }}>None yet.</div>}
-          {pnlAlerts.map((a) => (
-            <div
-              key={a.id}
-              style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 10px", fontSize: 12, fontFamily: mono }}
-            >
-              <span>Notify when PNL {a.value >= 0 ? "reaches +" : "drops to "}{a.value} USDT</span>
-              <span onClick={() => onRemovePnlAlert(t.id, a.id)} className="ft-btn" style={{ color: C.loss }}>
-                remove
-              </span>
+        {showPnlAlerts && (
+          <>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
+              {pnlAlerts.length === 0 && <div style={{ fontSize: 11.5, color: C.textDim }}>None yet.</div>}
+              {pnlAlerts.map((a) => (
+                <div
+                  key={a.id}
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 10px", fontSize: 12, fontFamily: mono }}
+                >
+                  <span>Notify when PNL {a.value >= 0 ? "reaches +" : "drops to "}{a.value} USDT</span>
+                  <span onClick={() => onRemovePnlAlert(t.id, a.id)} className="ft-btn" style={{ color: C.loss }}>
+                    remove
+                  </span>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-        <div style={{ display: "flex", gap: 6 }}>
-          <input
-            type="number"
-            value={pnlInput}
-            onChange={(e) => setPnlInput(e.target.value)}
-            placeholder="e.g. 50 USDT or -20 USDT"
-            style={{ ...selStyle(), width: 160 }}
-          />
-          <button
-            onClick={submitPnlAlert}
-            className="ft-btn"
-            style={{ background: C.amber, color: "#1A1300", border: "none", borderRadius: 6, padding: "6px 14px", fontSize: 12, fontWeight: 700 }}
-          >
-            + Add
-          </button>
-        </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input
+                type="number"
+                value={pnlInput}
+                onChange={(e) => setPnlInput(e.target.value)}
+                placeholder="e.g. 50 USDT or -20 USDT"
+                style={{ ...selStyle(), width: 160 }}
+              />
+              <button
+                onClick={submitPnlAlert}
+                className="ft-btn"
+                style={{ background: C.amber, color: "#1A1300", border: "none", borderRadius: 6, padding: "6px 14px", fontSize: 12, fontWeight: 700 }}
+              >
+                + Add
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -2841,6 +2903,7 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
   const [error, setError] = useState(null);
   const [ta, setTa] = useState(null);
   const [taStatus, setTaStatus] = useState("idle"); // idle | loading | live | error
+  const [showHelp, setShowHelp] = useState(false);
 
   const matchedRow = useMemo(() => {
     const sym = form.symbol.trim().toUpperCase();
@@ -3294,11 +3357,33 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
             <Stat label="Trend" value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.trend} tone={trendTone(ta.trend)} /> : "—"} />
             <Stat
               label="Strength"
-              value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} /> : "—"}
+              value={
+                taStatus === "loading" ? (
+                  "…"
+                ) : ta ? (
+                  <>
+                    <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} />
+                    {ta.adx !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>ADX {ta.adx.toFixed(0)}</span>}
+                  </>
+                ) : (
+                  "—"
+                )
+              }
             />
             <Stat
               label="Momentum"
-              value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} /> : "—"}
+              value={
+                taStatus === "loading" ? (
+                  "…"
+                ) : ta ? (
+                  <>
+                    <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} />
+                    {ta.rsi !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>RSI {ta.rsi.toFixed(0)}</span>}
+                  </>
+                ) : (
+                  "—"
+                )
+              }
             />
             <Stat
               label="Reversal"
@@ -3307,7 +3392,14 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
             <Stat label="Support" value={taStatus === "loading" ? "…" : ta?.support ? fmtPrice(ta.support) : "—"} />
             <Stat label="Resistance" value={taStatus === "loading" ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—"} />
           </div>
-          <TaConditionsNote />
+          <div
+            onClick={() => setShowHelp((v) => !v)}
+            className="ft-btn"
+            style={{ fontSize: 11, color: C.textMuted, marginTop: 12, display: "flex", alignItems: "center", gap: 4 }}
+          >
+            <span>{showHelp ? "▾" : "▸"}</span> How these are worked out
+          </div>
+          {showHelp && <TaConditionsNote />}
         </Card>
       )}
 
