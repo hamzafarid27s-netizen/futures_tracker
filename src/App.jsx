@@ -2700,6 +2700,7 @@ function marginRatioColor(pct) {
 function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRemoveRoiAlert, onAddPnlAlert, onRemovePnlAlert }) {
   const [athAtl, setAthAtl] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [athAtlInterval, setAthAtlInterval] = useState("1d");
   const [roiInput, setRoiInput] = useState("");
   const [pnlInput, setPnlInput] = useState("");
   const [ta, setTa] = useState(null);
@@ -2727,18 +2728,20 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
   const pnlAlerts = t.pnlAlerts || [];
 
   // Always-expanded row now loads its ATH/ATL once on mount rather than on
-  // a click-to-expand toggle.
+  // a click-to-expand toggle. Re-runs whenever the symbol or the chosen
+  // interval changes — 1d is the fast default, 1h lets the user scan for
+  // the exact all-time high/low off 1h candles like Analyze's precise scan.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
       try {
         const cacheMap = (await safeStorageGet("ath-atl-cache")) || {};
-        const key = t.symbol + "|1d";
+        const key = t.symbol + "|" + athAtlInterval;
         const cached = cacheMap[key];
-        const result = await fetchTrueAthAtl(t.symbol, "1d", cached, () => {});
+        const result = await fetchTrueAthAtl(t.symbol, athAtlInterval, cached, () => {});
         if (cancelled) return;
-        cacheMap[key] = { interval: "1d", ...result };
+        cacheMap[key] = { interval: athAtlInterval, ...result };
         await safeStorageSet("ath-atl-cache", cacheMap);
         setAthAtl(result);
       } catch {
@@ -2750,7 +2753,7 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
     return () => {
       cancelled = true;
     };
-  }, [t.symbol]);
+  }, [t.symbol, athAtlInterval]);
 
   // Trend / strength / momentum / support / resistance / reversal, plus
   // open interest — same read the Analyze tab and Screener use, scoped to
@@ -2887,11 +2890,25 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
           {statBox("▼ Resistance", taLoading ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—", C.loss)}
         </div>
 
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div style={{ fontSize: 10, color: C.textMuted }}>All-Time High &amp; Low</div>
+          <select
+            value={athAtlInterval}
+            onChange={(e) => setAthAtlInterval(e.target.value)}
+            style={{ ...selStyle(), fontSize: 10.5, padding: "3px 6px" }}
+          >
+            <option value="1d">1d (fast)</option>
+            <option value="1h">1h (precise, slower)</option>
+          </select>
+        </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
           <div style={{ background: C.lossBg, borderRadius: 8, padding: "10px 12px" }}>
             <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 2 }}>All Time Low</div>
             <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.loss }}>
               {loading ? "…" : athAtl ? fmtPrice(athAtl.atl) : "—"}
+            </div>
+            <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>
+              {loading ? "" : athAtl ? fmtDate(athAtl.atlTime) : ""}
             </div>
           </div>
           <div style={{ background: C.gainBg, borderRadius: 8, padding: "10px 12px" }}>
@@ -2899,8 +2916,16 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
             <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.gain }}>
               {loading ? "…" : athAtl ? fmtPrice(athAtl.ath) : "—"}
             </div>
+            <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>
+              {loading ? "" : athAtl ? fmtDate(athAtl.athTime) : ""}
+            </div>
           </div>
         </div>
+        {athAtlInterval === "1h" && loading && (
+          <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: -8, marginBottom: 14, fontFamily: mono }}>
+            Scanning full 1h history — this can take a bit longer…
+          </div>
+        )}
 
         <div
           onClick={() => setShowHelp((v) => !v)}
