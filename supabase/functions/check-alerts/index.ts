@@ -169,6 +169,21 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // ---- funding times (for "funding fee in Xm" trade alerts) — one
+    // request covering every symbol, filtered down to the ones tracked ----
+    const fundingBySymbol: Record<string, { rate: number; nextFundingTime: number }> = {};
+    if (trackedSymbols.size) {
+      const premRes = await fetch("https://fapi.binance.com/fapi/v1/premiumIndex");
+      if (premRes.ok) {
+        const premData = (await premRes.json()) as Array<{ symbol: string; lastFundingRate: string; nextFundingTime: number }>;
+        premData.forEach((d) => {
+          if (trackedSymbols.has(d.symbol)) {
+            fundingBySymbol[d.symbol] = { rate: parseFloat(d.lastFundingRate), nextFundingTime: d.nextFundingTime };
+          }
+        });
+      }
+    }
+
     // ---- 2. current prices ----
     const tickerRes = await fetch("https://fapi.binance.com/fapi/v1/ticker/24hr");
     if (!tickerRes.ok) return json({ error: `binance HTTP ${tickerRes.status}` }, 502);
@@ -289,6 +304,22 @@ Deno.serve(async (req: Request) => {
         stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: true, updated_at: new Date(nowMs).toISOString() });
       } else if (wasActive && nearPct > 2) {
         stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: false, updated_at: new Date(nowMs).toISOString() });
+      }
+    };
+
+    // "Funding fee in Xm" — fires once per trade per funding round. The
+    // round's own timestamp is baked into ruleKey, so once it passes a
+    // fresh nextFundingTime produces a brand-new key automatically (no
+    // explicit reset needed), and the stale-key cleanup below removes the
+    // old one once it's no longer the current round for that symbol.
+    const evalFundingAlert = (deviceId: string, ruleKey: string, onEnter: () => { title: string; body: string }) => {
+      const key = `${deviceId}|${ruleKey}`;
+      seenKeys.add(key);
+      const wasActive = activeMap[key] ?? false;
+      if (!wasActive) {
+        const msg = onEnter();
+        toFire.push({ deviceId, ruleKey, ...msg });
+        stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: true, updated_at: new Date(nowMs).toISOString() });
       }
     };
 
@@ -458,6 +489,19 @@ Deno.serve(async (req: Request) => {
               evalLevelTouch(deviceId, `resistance:${t.id}`, nearPct, () => ({
                 title: `${t.symbol.replace("USDT", "/USDT")} touched resistance`,
                 body: `Price ${cur.toPrecision(6)} is near resistance ${levels.resistance!.toPrecision(6)}`,
+              }));
+            }
+          }
+
+          // Funding fee settling within 10 minutes.
+          const fundingInfo = fundingBySymbol[t.symbol];
+          if (fundingInfo && fundingInfo.nextFundingTime) {
+            const msLeft = fundingInfo.nextFundingTime - nowMs;
+            if (msLeft > 0 && msLeft <= 10 * 60 * 1000) {
+              const minutesLeft = Math.max(1, Math.round(msLeft / 60000));
+              evalFundingAlert(deviceId, `funding:${t.id}:${fundingInfo.nextFundingTime}`, () => ({
+                title: `${t.symbol.replace("USDT", "/USDT")} funding fee in ${minutesLeft}m`,
+                body: `Rate ${fundingInfo.rate >= 0 ? "+" : ""}${(fundingInfo.rate * 100).toFixed(4)}% applies soon`,
               }));
             }
           }

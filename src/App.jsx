@@ -389,6 +389,7 @@ export default function FuturesTracker() {
   const ruleActiveRef = useRef({});
   const tradeThresholdActiveRef = useRef({});
   const tradeLevelActiveRef = useRef({});
+  const fundingAlertFiredRef = useRef({}); // `${tradeId}:${nextFundingTime}` -> true once notified
 
   const bufferRef = useRef({}); // symbol -> [{t, price}]
   const storageLoaded = useRef(false);
@@ -952,6 +953,31 @@ export default function FuturesTracker() {
     }
   }, []);
 
+  // ---- tracked trade is about to pay/receive a funding fee ----
+  const fireFundingAlert = useCallback((trade, minutesLeft, rate) => {
+    const now = Date.now();
+    const event = {
+      id: trade.id + "-funding-" + now,
+      symbol: trade.symbol,
+      minutes: null,
+      label: `Funding fee in ${minutesLeft}m`,
+      thresholdPct: null,
+      actualChange: rate !== null ? rate * 100 : null,
+      time: now,
+      isFlip: true,
+    };
+    setTriggered((prev) => [event, ...prev].slice(0, 50));
+    if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+      try {
+        new Notification(`${trade.symbol.replace("USDT", "/USDT")} funding fee in ${minutesLeft}m`, {
+          body: rate !== null ? `Rate ${rate >= 0 ? "+" : ""}${(rate * 100).toFixed(4)}% applies soon` : "Funding settlement coming up",
+        });
+      } catch {
+        /* notifications unavailable */
+      }
+    }
+  }, []);
+
   // ---- change from rolling buffer (covers up to ~65 min) ----
   const changeFromBuffer = useCallback((symbol, minutes) => {
     const buf = bufferRef.current[symbol];
@@ -1230,6 +1256,31 @@ export default function FuturesTracker() {
       }
     });
   }, [rows, savedTrades, taMap, fireTradeFlip, fireTradeThreshold, fireTradeLevel]);
+
+  // ---- tracked trades: notify 10 minutes before a funding fee settles ----
+  // Keyed by trade id + that funding round's own timestamp, so each 8h
+  // funding interval only ever notifies once per trade, and the next
+  // interval (a new nextFundingTime) is free to fire again automatically —
+  // no explicit reset needed.
+  useEffect(() => {
+    if (savedTrades.length === 0) return;
+    const check = () => {
+      const now = Date.now();
+      savedTrades.forEach((t) => {
+        const f = funding[t.symbol];
+        if (!f || !f.nextFundingTime) return;
+        const msLeft = f.nextFundingTime - now;
+        if (msLeft <= 0 || msLeft > 10 * 60 * 1000) return;
+        const key = t.id + ":" + f.nextFundingTime;
+        if (fundingAlertFiredRef.current[key]) return;
+        fundingAlertFiredRef.current[key] = true;
+        fireFundingAlert(t, Math.max(1, Math.round(msLeft / 60000)), f.rate);
+      });
+    };
+    check();
+    const id = setInterval(check, 15000);
+    return () => clearInterval(id);
+  }, [savedTrades, funding, fireFundingAlert]);
 
   // ---- detail data (full interval grid) for watchlisted / long-interval-alerted / expanded symbols ----
   const monitored = useMemo(() => {
