@@ -1742,6 +1742,9 @@ export default function FuturesTracker() {
             taServerCount={taServerCount}
             screenerAthAtl={screenerAthAtl}
             scanScreenerAthAtl={scanScreenerAthAtl}
+            athAtlMap={athAtlMap}
+            athAtlBulkStatus={athAtlBulkStatus}
+            startAthAtlBulk={startAthAtlBulk}
             logos={coinLogos}
           />
         )}
@@ -3372,6 +3375,9 @@ function ScreenerPanel({
   taServerCount,
   screenerAthAtl,
   scanScreenerAthAtl,
+  athAtlMap,
+  athAtlBulkStatus,
+  startAthAtlBulk,
   logos,
 }) {
   const [query, setQuery] = useState("");
@@ -3379,6 +3385,17 @@ function ScreenerPanel({
   const [levelFilter, setLevelFilter] = useState("none"); // none | support | resistance | reversal
   const [sortKey, setSortKey] = useState("volume"); // volume | rsi | adx
   const scanned = serverMode ? taServerCount : Object.keys(taMap).length;
+
+  // ATH/ATL show automatically here, sourced from the same 1d bulk scan the
+  // Market tab uses — no click needed. Kick that bulk scan off the moment
+  // this tab is opened if nothing has started it yet, so the columns fill
+  // in on their own instead of requiring a visit to Market's Near ATH/ATL
+  // filters first. The precise 1h scan (screenerAthAtl) stays strictly
+  // opt-in — that one only ever runs when the user taps it for a pair.
+  useEffect(() => {
+    if (athAtlBulkStatus === "idle") startAthAtlBulk();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // A pair the background/bulk scan hasn't reached yet gets scanned
   // on-demand the moment a search narrows down to it, instead of just
@@ -3440,70 +3457,58 @@ function ScreenerPanel({
   // One ATH/ATL cell — shows the cached value (tap to rescan), a spinner
   // with batch progress while it's running, or a "Scan" button to kick it
   // off. ATH and ATL always come from the same single scan.
+  // Shows automatically from the 1d bulk scan (athAtlMap) the moment it's
+  // available — no click needed. A small link underneath lets the user
+  // opt into the exact 1h-based value for that one pair (screenerAthAtl);
+  // once that's done it takes over as the displayed value and is marked
+  // "1h" so it's clear it's the more precise figure.
   const athAtlCell = (r, field) => {
-    const entry = screenerAthAtl[r.symbol];
-    if (entry?.status === "done") {
-      const timeField = field === "ath" ? "athTime" : "atlTime";
-      return (
-        <button
-          className="ft-btn"
-          onClick={() => scanScreenerAthAtl(r.symbol)}
-          title="Tap to rescan"
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "flex-start",
-            gap: 1,
-            fontFamily: mono,
-            background: "transparent",
-            border: "none",
-            padding: 0,
-            cursor: "pointer",
-          }}
-        >
-          <span style={{ fontSize: 12, fontWeight: 600, color: field === "ath" ? C.gain : C.loss }}>
-            {fmtPrice(entry[field])}
-          </span>
-          <span style={{ fontSize: 10, color: C.textDim }}>
-            {entry[timeField] ? new Date(entry[timeField]).toISOString().slice(0, 10) : "—"}
-          </span>
-        </button>
-      );
-    }
-    if (entry?.status === "loading") {
-      return (
-        <span style={{ fontSize: 11, color: C.textDim, fontFamily: mono }}>
-          {entry.progress ? `scanning (${entry.progress})…` : "scanning…"}
-        </span>
-      );
-    }
-    if (entry?.status === "error") {
-      return (
-        <button
-          className="ft-btn"
-          onClick={() => scanScreenerAthAtl(r.symbol)}
-          style={{ fontSize: 11, color: C.loss, background: "transparent", border: `1px solid ${C.loss}`, borderRadius: 6, padding: "3px 8px" }}
-        >
-          retry
-        </button>
-      );
-    }
+    const precise = screenerAthAtl[r.symbol];
+    const bulk = athAtlMap[r.symbol];
+    const timeField = field === "ath" ? "athTime" : "atlTime";
+    const preciseDone = precise?.status === "done";
+    const value = preciseDone ? precise[field] : bulk ? bulk[field] : null;
+    const time = preciseDone ? precise[timeField] : bulk ? bulk[timeField] : null;
+    const linkStyle = {
+      fontSize: 9.5,
+      color: C.textMuted,
+      background: "none",
+      border: "none",
+      padding: 0,
+      textAlign: "left",
+      textDecoration: "underline",
+      cursor: "pointer",
+    };
+
     return (
-      <button
-        className="ft-btn"
-        onClick={() => scanScreenerAthAtl(r.symbol)}
-        style={{
-          fontSize: 11,
-          fontWeight: 600,
-          color: C.textMuted,
-          background: C.panelAlt,
-          border: `1px solid ${C.border}`,
-          borderRadius: 6,
-          padding: "4px 9px",
-        }}
-      >
-        Scan
-      </button>
+      <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+        {value != null ? (
+          <>
+            <span style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, color: field === "ath" ? C.gain : C.loss }}>
+              {fmtPrice(value)}
+            </span>
+            <span style={{ fontSize: 10, color: C.textDim, fontFamily: mono }}>
+              {time ? new Date(time).toISOString().slice(0, 10) : "—"}
+              {preciseDone ? " · 1h" : ""}
+            </span>
+          </>
+        ) : (
+          <span style={{ fontSize: 11, color: C.textDim, fontFamily: mono }}>scanning…</span>
+        )}
+        {precise?.status === "loading" ? (
+          <span style={{ fontSize: 9.5, color: C.textDim }}>
+            {precise.progress ? `1h scan (batch ${precise.progress})…` : "1h scan…"}
+          </span>
+        ) : precise?.status === "error" ? (
+          <button className="ft-btn" onClick={() => scanScreenerAthAtl(r.symbol)} style={{ ...linkStyle, color: C.loss }}>
+            1h scan failed · retry
+          </button>
+        ) : (
+          <button className="ft-btn" onClick={() => scanScreenerAthAtl(r.symbol)} style={linkStyle}>
+            {preciseDone ? "rescan 1h" : "scan precise 1h"}
+          </button>
+        )}
+      </div>
     );
   };
 
@@ -3653,8 +3658,8 @@ function ScreenerPanel({
               <th style={{ padding: "6px 8px" }}>Support</th>
               <th style={{ padding: "6px 8px" }}>Resistance</th>
               <th style={{ padding: "6px 8px" }}>Reversal</th>
-              <th style={{ padding: "6px 8px" }}>ATH (1h)</th>
-              <th style={{ padding: "6px 8px" }}>ATL (1h)</th>
+              <th style={{ padding: "6px 8px" }}>ATH</th>
+              <th style={{ padding: "6px 8px" }}>ATL</th>
             </tr>
           </thead>
           <tbody>
@@ -3732,7 +3737,7 @@ function ScreenerPanel({
           {serverMode
             ? `Scanned server-side${taSyncedAt ? ` · newest ${agoLabel(taSyncedAt)}` : ""} · EMA20/50, RSI14, ADX14, 60-candle swing levels`
             : "Based on official Binance 4h candles · EMA20/50, RSI14, ADX14, 60-candle swing levels"}
-          {" · tap ATH/ATL to scan a pair's true 1h all-time high/low"}
+          {" · ATH/ATL fill in automatically · tap \"scan precise 1h\" for the exact 1h-based value"}
         </span>
       </div>
     </>
