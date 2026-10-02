@@ -2790,8 +2790,12 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 12, columnGap: 10, marginBottom: 14 }}>
           {statBox("Entry Price", fmtPrice(t.entry), C.blue)}
           {statBox("Mark Price", cur !== null ? fmtPrice(cur) : "—", cur !== null ? (cur > t.entry ? C.gain : cur < t.entry ? C.loss : C.text) : C.text)}
-          {statBox("Position Size", sizeU > 0 ? fmtCompact(sizeU) + " USDT" : "—", C.teal)}
-          {statBox("Margin", fmtCompact(t.margin) + " USDT", C.pink)}
+          {statBox(
+            "Position Size",
+            positionValueNow !== null ? fmtCompact(positionValueNow) + " USDT" : sizeU > 0 ? fmtCompact(sizeU) + " USDT" : "—",
+            C.teal
+          )}
+          {statBox("Margin", fmtCompact(marginBalance !== null ? marginBalance : t.margin) + " USDT", C.pink)}
           {statBox("Margin Ratio (est.)", marginRatio !== null ? marginRatio.toFixed(1) + "%" : "—", marginRatioColor(marginRatio))}
           {statBox(
             "Funding / countdown",
@@ -3152,19 +3156,50 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
 
   const trackTrade = () => {
     if (!matchedRow || !entryNum || !form.margin || !form.leverage) return;
-    setSavedTrades((prev) => [
-      ...prev,
-      {
-        id: matchedRow.symbol + "-" + Date.now(),
-        symbol: matchedRow.symbol,
-        entry: entryNum,
-        margin: parseFloat(form.margin),
-        leverage: parseFloat(form.leverage),
-        dir: form.dir,
-        roiAlerts: [],
-        pnlAlerts: [],
-      },
-    ]);
+    const newMargin = parseFloat(form.margin);
+    const newLeverage = parseFloat(form.leverage);
+    const newNotional = newMargin * newLeverage;
+    const newQty = entryNum ? newNotional / entryNum : 0;
+
+    setSavedTrades((prev) => {
+      // Same symbol + same direction already tracked — merge into it
+      // instead of adding a separate row, the way Binance nets multiple
+      // fills into one position: a size-weighted average entry price,
+      // combined margin, and an effective leverage so margin × leverage
+      // still equals the combined notional. PnL/ROI then flow from these
+      // merged numbers automatically. A trade in the opposite direction
+      // stays separate (that's a reduce/hedge, not an add).
+      const idx = prev.findIndex((t) => t.symbol === matchedRow.symbol && t.dir === form.dir);
+      if (idx === -1) {
+        return [
+          ...prev,
+          {
+            id: matchedRow.symbol + "-" + Date.now(),
+            symbol: matchedRow.symbol,
+            entry: entryNum,
+            margin: newMargin,
+            leverage: newLeverage,
+            dir: form.dir,
+            roiAlerts: [],
+            pnlAlerts: [],
+          },
+        ];
+      }
+      const existing = prev[idx];
+      const existingNotional = existing.margin * existing.leverage;
+      const existingQty = existing.entry ? existingNotional / existing.entry : 0;
+      const totalQty = existingQty + newQty;
+      const totalNotional = existingNotional + newNotional;
+      const totalMargin = existing.margin + newMargin;
+      const next = [...prev];
+      next[idx] = {
+        ...existing,
+        entry: totalQty ? totalNotional / totalQty : existing.entry,
+        margin: totalMargin,
+        leverage: totalMargin ? totalNotional / totalMargin : existing.leverage,
+      };
+      return next;
+    });
   };
   const removeTrade = (id) => setSavedTrades((prev) => prev.filter((t) => t.id !== id));
   const addRoiAlert = (tradeId, pct) =>
