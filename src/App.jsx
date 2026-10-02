@@ -2790,12 +2790,8 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 12, columnGap: 10, marginBottom: 14 }}>
           {statBox("Entry Price", fmtPrice(t.entry), C.blue)}
           {statBox("Mark Price", cur !== null ? fmtPrice(cur) : "—", cur !== null ? (cur > t.entry ? C.gain : cur < t.entry ? C.loss : C.text) : C.text)}
-          {statBox(
-            "Position Size",
-            positionValueNow !== null ? fmtCompact(positionValueNow) + " USDT" : sizeU > 0 ? fmtCompact(sizeU) + " USDT" : "—",
-            C.teal
-          )}
-          {statBox("Margin", fmtCompact(marginBalance !== null ? marginBalance : t.margin) + " USDT", C.pink)}
+          {statBox("Position Size", sizeU > 0 ? fmtCompact(sizeU) + " USDT" : "—", C.teal)}
+          {statBox("Margin", fmtCompact(t.margin) + " USDT", C.pink)}
           {statBox("Margin Ratio (est.)", marginRatio !== null ? marginRatio.toFixed(1) + "%" : "—", marginRatioColor(marginRatio))}
           {statBox(
             "Funding / countdown",
