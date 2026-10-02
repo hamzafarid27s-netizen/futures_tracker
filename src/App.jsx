@@ -16,6 +16,10 @@ const DARK_THEME = {
   loss: "#FF5C7A",
   lossBg: "rgba(255,92,122,0.12)",
   amber: "#E8A33D",
+  blue: "#4F9CFF",
+  purple: "#B58EFF",
+  teal: "#2DD4CF",
+  pink: "#FF7AB8",
   shadow: "0 8px 24px rgba(0,0,0,0.4)",
 };
 
@@ -34,6 +38,10 @@ const LIGHT_THEME = {
   loss: "#D6425A",
   lossBg: "rgba(214,66,90,0.10)",
   amber: "#B7791F",
+  blue: "#1D6FD1",
+  purple: "#7C4DFF",
+  teal: "#0E8A86",
+  pink: "#D1368A",
   shadow: "0 8px 24px rgba(20,25,35,0.10)",
 };
 
@@ -2723,10 +2731,10 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
       </div>
       <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 12, columnGap: 10, marginBottom: 14 }}>
-          {statBox("Entry Price", fmtPrice(t.entry))}
-          {statBox("Mark Price", cur !== null ? fmtPrice(cur) : "—")}
-          {statBox("Position Size", sizeU > 0 ? fmtCompact(sizeU) + " USDT" : "—")}
-          {statBox("Margin", fmtCompact(t.margin) + " USDT")}
+          {statBox("Entry Price", fmtPrice(t.entry), C.blue)}
+          {statBox("Mark Price", cur !== null ? fmtPrice(cur) : "—", C.purple)}
+          {statBox("Position Size", sizeU > 0 ? fmtCompact(sizeU) + " USDT" : "—", C.teal)}
+          {statBox("Margin", fmtCompact(t.margin) + " USDT", C.pink)}
           {statBox("Margin Ratio (est.)", marginRatio !== null ? marginRatio.toFixed(1) + "%" : "—", marginRatioColor(marginRatio))}
           {statBox(
             "Funding / countdown",
@@ -2767,8 +2775,8 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
             )
           )}
           {statBox("Reversal", taLoading ? "…" : ta ? <TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} /> : "—")}
-          {statBox("Support", taLoading ? "…" : ta?.support ? fmtPrice(ta.support) : "—")}
-          {statBox("Resistance", taLoading ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—")}
+          {statBox("Support", taLoading ? "…" : ta?.support ? fmtPrice(ta.support) : "—", C.gain)}
+          {statBox("Resistance", taLoading ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—", C.loss)}
           {statBox("All Time High", loading ? "…" : athAtl ? fmtPrice(athAtl.ath) : "—", C.gain)}
           {statBox("All Time Low", loading ? "…" : athAtl ? fmtPrice(athAtl.atl) : "—", C.loss)}
         </div>
@@ -2786,19 +2794,23 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
           onClick={() => setShowRoiAlerts((v) => !v)}
           className="ft-btn"
           style={{
-            fontSize: 10.5,
+            fontSize: 13,
             fontWeight: 700,
-            color: C.textDim,
+            color: C.text,
             textTransform: "uppercase",
             letterSpacing: "0.03em",
-            marginBottom: showRoiAlerts ? 6 : 0,
+            marginBottom: showRoiAlerts ? 8 : 0,
             marginTop: 14,
             display: "flex",
             alignItems: "center",
-            gap: 5,
+            gap: 7,
+            background: C.panel,
+            border: `1px solid ${C.border}`,
+            borderRadius: 8,
+            padding: "10px 12px",
           }}
         >
-          <span>{showRoiAlerts ? "▾" : "▸"}</span> ROI% target alerts {roiAlerts.length > 0 ? `(${roiAlerts.length})` : ""}
+          <span style={{ fontSize: 11 }}>{showRoiAlerts ? "▾" : "▸"}</span> ROI% target alerts {roiAlerts.length > 0 ? `(${roiAlerts.length})` : ""}
         </div>
         {showRoiAlerts && (
           <>
@@ -2839,18 +2851,23 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
           onClick={() => setShowPnlAlerts((v) => !v)}
           className="ft-btn"
           style={{
-            fontSize: 10.5,
+            fontSize: 13,
             fontWeight: 700,
-            color: C.textDim,
+            color: C.text,
             textTransform: "uppercase",
             letterSpacing: "0.03em",
-            marginBottom: showPnlAlerts ? 6 : 0,
+            marginBottom: showPnlAlerts ? 8 : 0,
+            marginTop: 10,
             display: "flex",
             alignItems: "center",
-            gap: 5,
+            gap: 7,
+            background: C.panel,
+            border: `1px solid ${C.border}`,
+            borderRadius: 8,
+            padding: "10px 12px",
           }}
         >
-          <span>{showPnlAlerts ? "▾" : "▸"}</span> PNL (USDT) target alerts {pnlAlerts.length > 0 ? `(${pnlAlerts.length})` : ""}
+          <span style={{ fontSize: 11 }}>{showPnlAlerts ? "▾" : "▸"}</span> PNL (USDT) target alerts {pnlAlerts.length > 0 ? `(${pnlAlerts.length})` : ""}
         </div>
         {showPnlAlerts && (
           <>
@@ -3279,48 +3296,60 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
         {error && <div style={{ fontSize: 12, color: C.loss, marginTop: 10 }}>{error}</div>}
       </Card>
 
-      {matchedRow && entryNum > 0 && pnlUsdt !== null && (
+      {matchedRow && (
         <Card
-          title="Live Read"
+          title="Analysis"
           right={
-            <button
-              onClick={trackTrade}
-              className="ft-btn"
-              style={{ background: "transparent", color: C.amber, border: `1px solid ${C.amber}`, borderRadius: 6, padding: "4px 10px", fontSize: 10.5, fontWeight: 600 }}
-            >
-              + Track for flip alerts
-            </button>
+            entryNum > 0 && pnlUsdt !== null ? (
+              <button
+                onClick={trackTrade}
+                className="ft-btn"
+                style={{ background: "transparent", color: C.amber, border: `1px solid ${C.amber}`, borderRadius: 6, padding: "4px 10px", fontSize: 10.5, fontWeight: 600 }}
+              >
+                + Track for flip alerts
+              </button>
+            ) : null
           }
         >
-          <div style={{ display: "flex", gap: 24, marginBottom: 16 }}>
-            <Stat label="PnL" value={`${pnlUsdt >= 0 ? "+" : ""}${pnlUsdt.toFixed(2)} USDT`} color={pctColor(pnlUsdt)} />
-            <Stat label="ROI (on margin)" value={fmtPct(roiPct)} color={pctColor(roiPct)} />
-          </div>
-
-          {risk && (
-            <>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-                <div style={{ flex: 1, height: 8, borderRadius: 4, background: C.border, overflow: "hidden" }}>
-                  <div style={{ width: `${risk.score}%`, height: "100%", background: risk.color }} />
-                </div>
-                <div style={{ fontSize: 12.5, fontWeight: 700, color: risk.color, whiteSpace: "nowrap" }}>{risk.label}</div>
+          {entryNum > 0 && pnlUsdt !== null && (
+            <div style={{ paddingBottom: 14, marginBottom: 14, borderBottom: `1px solid ${C.border}` }}>
+              <div style={{ display: "flex", gap: 24, marginBottom: 16 }}>
+                <Stat label="PnL" value={`${pnlUsdt >= 0 ? "+" : ""}${pnlUsdt.toFixed(2)} USDT`} color={pctColor(pnlUsdt)} />
+                <Stat label="ROI (on margin)" value={fmtPct(roiPct)} color={pctColor(roiPct)} />
               </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-                {risk.factors.map((f, i) => (
-                  <div key={i} style={{ fontSize: 12, color: f.bad ? C.text : C.textMuted, display: "flex", gap: 6 }}>
-                    <span style={{ color: f.bad ? C.amber : C.gain }}>{f.bad ? "!" : "✓"}</span>
-                    <span>{f.text}</span>
+
+              {risk && (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                    <div style={{ flex: 1, height: 8, borderRadius: 4, background: C.border, overflow: "hidden" }}>
+                      <div style={{ width: `${risk.score}%`, height: "100%", background: risk.color }} />
+                    </div>
+                    <div style={{ fontSize: 12.5, fontWeight: 700, color: risk.color, whiteSpace: "nowrap" }}>{risk.label}</div>
                   </div>
-                ))}
-              </div>
-            </>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                    {risk.factors.map((f, i) => (
+                      <div key={i} style={{ fontSize: 12, color: f.bad ? C.text : C.textMuted, display: "flex", gap: 6 }}>
+                        <span style={{ color: f.bad ? C.amber : C.gain }}>{f.bad ? "!" : "✓"}</span>
+                        <span>{f.text}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
           )}
-        </Card>
-      )}
 
-      {matchedRow && (
-        <Card title="Funding & 24h Range">
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontFamily: mono }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              fontSize: 13,
+              fontFamily: mono,
+              paddingBottom: 14,
+              marginBottom: 14,
+              borderBottom: `1px solid ${C.border}`,
+            }}
+          >
             <div>
               <div style={{ color: C.textDim, fontSize: 10.5, marginBottom: 3 }}>Funding / countdown</div>
               <div>
@@ -3337,141 +3366,140 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
               </div>
             </div>
           </div>
-        </Card>
-      )}
 
-      {matchedRow && (
-        <Card title="Volume, OI & Technicals">
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 14, columnGap: 10 }}>
-            <Stat label="24h Volume" value={fmtCompact(parseFloat(matchedRow.quoteVolume)) + " USDT"} />
-            <Stat
-              label="Open Interest"
-              value={
-                extrasStatus === "loading"
-                  ? "…"
-                  : extras?.multiExchange?.binance?.oi != null
-                  ? fmtCompact(extras.multiExchange.binance.oi)
-                  : "—"
-              }
-            />
-            <Stat label="Trend" value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.trend} tone={trendTone(ta.trend)} /> : "—"} />
-            <Stat
-              label="Strength"
-              value={
-                taStatus === "loading" ? (
-                  "…"
-                ) : ta ? (
-                  <>
-                    <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} />
-                    {ta.adx !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>ADX {ta.adx.toFixed(0)}</span>}
-                  </>
-                ) : (
-                  "—"
-                )
-              }
-            />
-            <Stat
-              label="Momentum"
-              value={
-                taStatus === "loading" ? (
-                  "…"
-                ) : ta ? (
-                  <>
-                    <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} />
-                    {ta.rsi !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>RSI {ta.rsi.toFixed(0)}</span>}
-                  </>
-                ) : (
-                  "—"
-                )
-              }
-            />
-            <Stat
-              label="Reversal"
-              value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} /> : "—"}
-            />
-            <Stat label="Support" value={taStatus === "loading" ? "…" : ta?.support ? fmtPrice(ta.support) : "—"} />
-            <Stat label="Resistance" value={taStatus === "loading" ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—"} />
-          </div>
-          <div
-            onClick={() => setShowHelp((v) => !v)}
-            className="ft-btn"
-            style={{ fontSize: 11, color: C.textMuted, marginTop: 12, display: "flex", alignItems: "center", gap: 4 }}
-          >
-            <span>{showHelp ? "▾" : "▸"}</span> How these are worked out
-          </div>
-          {showHelp && <TaConditionsNote />}
-        </Card>
-      )}
-
-      {matchedRow && (
-        <Card
-          title="All-Time High & Low"
-          right={
-            <select
-              value={athAtlInterval}
-              onChange={(e) => setAthAtlInterval(e.target.value)}
-              style={{ ...selStyle(), fontSize: 10.5, padding: "3px 6px" }}
+          <div style={{ paddingBottom: 14, marginBottom: 14, borderBottom: `1px solid ${C.border}` }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 14, columnGap: 10 }}>
+              <Stat label="24h Volume" value={fmtCompact(parseFloat(matchedRow.quoteVolume)) + " USDT"} color={C.teal} />
+              <Stat
+                label="Open Interest"
+                value={
+                  extrasStatus === "loading"
+                    ? "…"
+                    : extras?.multiExchange?.binance?.oi != null
+                    ? fmtCompact(extras.multiExchange.binance.oi)
+                    : "—"
+                }
+                color={C.pink}
+              />
+              <Stat label="Trend" value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.trend} tone={trendTone(ta.trend)} /> : "—"} />
+              <Stat
+                label="Strength"
+                value={
+                  taStatus === "loading" ? (
+                    "…"
+                  ) : ta ? (
+                    <>
+                      <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} />
+                      {ta.adx !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>ADX {ta.adx.toFixed(0)}</span>}
+                    </>
+                  ) : (
+                    "—"
+                  )
+                }
+              />
+              <Stat
+                label="Momentum"
+                value={
+                  taStatus === "loading" ? (
+                    "…"
+                  ) : ta ? (
+                    <>
+                      <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} />
+                      {ta.rsi !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>RSI {ta.rsi.toFixed(0)}</span>}
+                    </>
+                  ) : (
+                    "—"
+                  )
+                }
+              />
+              <Stat
+                label="Reversal"
+                value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} /> : "—"}
+              />
+              <Stat label="Support" value={taStatus === "loading" ? "…" : ta?.support ? fmtPrice(ta.support) : "—"} color={C.gain} />
+              <Stat label="Resistance" value={taStatus === "loading" ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—"} color={C.loss} />
+            </div>
+            <div
+              onClick={() => setShowHelp((v) => !v)}
+              className="ft-btn"
+              style={{ fontSize: 11, color: C.textMuted, marginTop: 12, display: "flex", alignItems: "center", gap: 4 }}
             >
-              <option value="1d">1d (fast)</option>
-              <option value="1h">1h (precise, slower)</option>
-            </select>
-          }
-        >
-          {athAtlLoading && (
-            <div style={{ fontSize: 12, color: C.textMuted, fontFamily: mono }}>
-              Downloading full history…{" "}
-              {athAtlProgress ? `batch ${athAtlProgress.batch}, ${athAtlProgress.totalSoFar.toLocaleString()} candles so far` : "starting…"}
+              <span>{showHelp ? "▾" : "▸"}</span> How these are worked out
             </div>
-          )}
+            {showHelp && <TaConditionsNote />}
+          </div>
 
-          {athAtlError && <div style={{ fontSize: 12, color: C.loss }}>{athAtlError}</div>}
-
-          {athAtl && !athAtlLoading && (
-            <div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
-                <div style={{ background: C.gainBg, borderRadius: 8, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time High</div>
-                  <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.gain }}>{fmtPrice(athAtl.ath)}</div>
-                  <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.athTime)}</div>
-                </div>
-                <div style={{ background: C.lossBg, borderRadius: 8, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time Low</div>
-                  <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.loss }}>{fmtPrice(athAtl.atl)}</div>
-                  <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.atlTime)}</div>
-                </div>
-                <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>High Close</div>
-                  <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.text }}>{fmtPrice(athAtl.highClose)}</div>
-                  <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.highCloseTime)}</div>
-                </div>
-                <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>Low Close</div>
-                  <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.text }}>{fmtPrice(athAtl.lowClose)}</div>
-                  <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.lowCloseTime)}</div>
-                </div>
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ fontSize: 10.5, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em" }}>
+                All-Time High &amp; Low
               </div>
-
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, fontFamily: mono, marginBottom: 10 }}>
-                <span style={{ color: C.textMuted }}>Distance from All-Time High</span>
-                <span style={{ color: pctColor(distFromAth), fontWeight: 700 }}>{fmtPct(distFromAth)}</span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, fontFamily: mono, marginBottom: 12 }}>
-                <span style={{ color: C.textMuted }}>Distance from All-Time Low</span>
-                <span style={{ color: pctColor(distFromAtl), fontWeight: 700 }}>{fmtPct(distFromAtl)}</span>
-              </div>
-
-              <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
-                Since {fmtDate(athAtl.firstCandleTime)} · {athAtl.totalCandles.toLocaleString()} candles scanned · cached in this browser, future checks only fetch what's new
-              </div>
-              <button
-                onClick={runAthAtl}
-                className="ft-btn"
-                style={{ background: "transparent", color: C.textMuted, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 12px", fontSize: 11 }}
+              <select
+                value={athAtlInterval}
+                onChange={(e) => setAthAtlInterval(e.target.value)}
+                style={{ ...selStyle(), fontSize: 10.5, padding: "3px 6px" }}
               >
-                Refresh
-              </button>
+                <option value="1d">1d (fast)</option>
+                <option value="1h">1h (precise, slower)</option>
+              </select>
             </div>
-          )}
+
+            {athAtlLoading && (
+              <div style={{ fontSize: 12, color: C.textMuted, fontFamily: mono }}>
+                Downloading full history…{" "}
+                {athAtlProgress ? `batch ${athAtlProgress.batch}, ${athAtlProgress.totalSoFar.toLocaleString()} candles so far` : "starting…"}
+              </div>
+            )}
+
+            {athAtlError && <div style={{ fontSize: 12, color: C.loss }}>{athAtlError}</div>}
+
+            {athAtl && !athAtlLoading && (
+              <div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+                  <div style={{ background: C.gainBg, borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time High</div>
+                    <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.gain }}>{fmtPrice(athAtl.ath)}</div>
+                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.athTime)}</div>
+                  </div>
+                  <div style={{ background: C.lossBg, borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time Low</div>
+                    <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.loss }}>{fmtPrice(athAtl.atl)}</div>
+                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.atlTime)}</div>
+                  </div>
+                  <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>High Close</div>
+                    <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.text }}>{fmtPrice(athAtl.highClose)}</div>
+                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.highCloseTime)}</div>
+                  </div>
+                  <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>Low Close</div>
+                    <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.text }}>{fmtPrice(athAtl.lowClose)}</div>
+                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.lowCloseTime)}</div>
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, fontFamily: mono, marginBottom: 10 }}>
+                  <span style={{ color: C.textMuted }}>Distance from All-Time High</span>
+                  <span style={{ color: pctColor(distFromAth), fontWeight: 700 }}>{fmtPct(distFromAth)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, fontFamily: mono, marginBottom: 12 }}>
+                  <span style={{ color: C.textMuted }}>Distance from All-Time Low</span>
+                  <span style={{ color: pctColor(distFromAtl), fontWeight: 700 }}>{fmtPct(distFromAtl)}</span>
+                </div>
+
+                <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+                  Since {fmtDate(athAtl.firstCandleTime)} · {athAtl.totalCandles.toLocaleString()} candles scanned · cached in this browser, future checks only fetch what's new
+                </div>
+                <button
+                  onClick={runAthAtl}
+                  className="ft-btn"
+                  style={{ background: "transparent", color: C.textMuted, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 12px", fontSize: 11 }}
+                >
+                  Refresh
+                </button>
+              </div>
+            )}
+          </div>
         </Card>
       )}
 
