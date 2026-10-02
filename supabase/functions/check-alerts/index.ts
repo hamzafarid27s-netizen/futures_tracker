@@ -150,6 +150,25 @@ Deno.serve(async (req: Request) => {
     const maxMinutes = Math.max(...neededMinutes);
     const retentionMin = Math.min(GLOBAL_BG_MAX_MIN + RETENTION_BUFFER_MIN, maxMinutes + RETENTION_BUFFER_MIN);
 
+    // ---- support/resistance levels (from the ta_screener table the
+    // compute-ta function maintains on its own schedule) — used below for
+    // "price touched support/resistance" tracked-trade alerts. Only fetched
+    // for symbols someone actually has a trade tracked on.
+    const trackedSymbols = new Set<string>();
+    (configs ?? []).forEach((cfg: any) => {
+      ((cfg.saved_trades ?? []) as Array<{ symbol: string }>).forEach((t) => trackedSymbols.add(t.symbol));
+    });
+    const levelBySymbol: Record<string, { support: number | null; resistance: number | null }> = {};
+    if (trackedSymbols.size) {
+      const { data: taRows } = await supabase
+        .from("ta_screener")
+        .select("symbol, support, resistance")
+        .in("symbol", [...trackedSymbols]);
+      (taRows ?? []).forEach((r: any) => {
+        levelBySymbol[r.symbol] = { support: r.support, resistance: r.resistance };
+      });
+    }
+
     // ---- 2. current prices ----
     const tickerRes = await fetch("https://fapi.binance.com/fapi/v1/ticker/24hr");
     if (!tickerRes.ok) return json({ error: `binance HTTP ${tickerRes.status}` }, 502);
@@ -249,6 +268,28 @@ Deno.serve(async (req: Request) => {
       // last run — no notification, no write. This is what stops the
       // repeat-spam, both for a long-passing condition and for a value
       // wobbling right at the line.
+    };
+
+    // "Price touched support/resistance" — enters when within 1% of the
+    // level, resets once price moves back out past 2% (a wider reset band
+    // than a plain hysteresis buffer, since price can sit right at a level
+    // for a while without this needing to re-fire every run).
+    const evalLevelTouch = (
+      deviceId: string,
+      ruleKey: string,
+      nearPct: number,
+      onEnter: () => { title: string; body: string }
+    ) => {
+      const key = `${deviceId}|${ruleKey}`;
+      seenKeys.add(key);
+      const wasActive = activeMap[key] ?? false;
+      if (!wasActive && nearPct <= 1) {
+        const msg = onEnter();
+        toFire.push({ deviceId, ruleKey, ...msg });
+        stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: true, updated_at: new Date(nowMs).toISOString() });
+      } else if (wasActive && nearPct > 2) {
+        stateUpdates.push({ device_id: deviceId, rule_key: ruleKey, is_active: false, updated_at: new Date(nowMs).toISOString() });
+      }
     };
 
     const labelFor = (min: number) => {
@@ -400,6 +441,25 @@ Deno.serve(async (req: Request) => {
                 body: `Target ${a.value >= 0 ? "+" : ""}${a.value} USDT · now ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT`,
               })
             );
+          }
+
+          // Mark price touches this trade's support or resistance level.
+          const levels = levelBySymbol[t.symbol];
+          if (levels) {
+            if (levels.support) {
+              const nearPct = (Math.abs(cur - levels.support) / cur) * 100;
+              evalLevelTouch(deviceId, `support:${t.id}`, nearPct, () => ({
+                title: `${t.symbol.replace("USDT", "/USDT")} touched support`,
+                body: `Price ${cur.toPrecision(6)} is near support ${levels.support!.toPrecision(6)}`,
+              }));
+            }
+            if (levels.resistance) {
+              const nearPct = (Math.abs(cur - levels.resistance) / cur) * 100;
+              evalLevelTouch(deviceId, `resistance:${t.id}`, nearPct, () => ({
+                title: `${t.symbol.replace("USDT", "/USDT")} touched resistance`,
+                body: `Price ${cur.toPrecision(6)} is near resistance ${levels.resistance!.toPrecision(6)}`,
+              }));
+            }
           }
         }
       }

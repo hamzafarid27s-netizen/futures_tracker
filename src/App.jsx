@@ -388,6 +388,7 @@ export default function FuturesTracker() {
   // "same alert notification multiple times" bug.
   const ruleActiveRef = useRef({});
   const tradeThresholdActiveRef = useRef({});
+  const tradeLevelActiveRef = useRef({});
 
   const bufferRef = useRef({}); // symbol -> [{t, price}]
   const storageLoaded = useRef(false);
@@ -925,6 +926,32 @@ export default function FuturesTracker() {
     }
   }, []);
 
+  // ---- tracked trade touches its support or resistance level ----
+  const fireTradeLevel = useCallback((trade, kind, level, price) => {
+    const now = Date.now();
+    const kindLabel = kind === "support" ? "Support" : "Resistance";
+    const event = {
+      id: trade.id + "-" + kind + "-" + now,
+      symbol: trade.symbol,
+      minutes: null,
+      label: `Price touched ${kindLabel.toLowerCase()} ${fmtPrice(level)}`,
+      thresholdPct: null,
+      actualChange: null,
+      time: now,
+      isFlip: true,
+    };
+    setTriggered((prev) => [event, ...prev].slice(0, 50));
+    if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+      try {
+        new Notification(`${trade.symbol.replace("USDT", "/USDT")} touched ${kindLabel.toLowerCase()}`, {
+          body: `Price ${fmtPrice(price)} is near ${kindLabel.toLowerCase()} ${fmtPrice(level)}`,
+        });
+      } catch {
+        /* notifications unavailable */
+      }
+    }
+  }, []);
+
   // ---- change from rolling buffer (covers up to ~65 min) ----
   const changeFromBuffer = useCallback((symbol, minutes) => {
     const buf = bufferRef.current[symbol];
@@ -1171,8 +1198,38 @@ export default function FuturesTracker() {
           fireTradeThreshold(t, "pnl", a.value, pnlUsdt, "reversed");
         }
       });
+
+      // Mark price touches this trade's support or resistance level (from
+      // the shared TA screener data) — edge-triggered with a wider reset
+      // band so lingering right at the level doesn't re-fire every tick.
+      const taRow = taMap[t.symbol];
+      if (taRow) {
+        const activeL = tradeLevelActiveRef.current;
+        if (taRow.support) {
+          const key = t.id + ":support";
+          const nearPct = (Math.abs(current - taRow.support) / current) * 100;
+          const was = !!activeL[key];
+          if (!was && nearPct <= 1) {
+            activeL[key] = true;
+            fireTradeLevel(t, "support", taRow.support, current);
+          } else if (was && nearPct > 2) {
+            activeL[key] = false;
+          }
+        }
+        if (taRow.resistance) {
+          const key = t.id + ":resistance";
+          const nearPct = (Math.abs(current - taRow.resistance) / current) * 100;
+          const was = !!activeL[key];
+          if (!was && nearPct <= 1) {
+            activeL[key] = true;
+            fireTradeLevel(t, "resistance", taRow.resistance, current);
+          } else if (was && nearPct > 2) {
+            activeL[key] = false;
+          }
+        }
+      }
     });
-  }, [rows, savedTrades, fireTradeFlip, fireTradeThreshold]);
+  }, [rows, savedTrades, taMap, fireTradeFlip, fireTradeThreshold, fireTradeLevel]);
 
   // ---- detail data (full interval grid) for watchlisted / long-interval-alerted / expanded symbols ----
   const monitored = useMemo(() => {
@@ -1607,22 +1664,6 @@ export default function FuturesTracker() {
               </button>
               <button
                 className="ft-btn"
-                onClick={() => toggleAthFilter("ath")}
-                style={{
-                  background: athFilterMode === "ath" ? C.gain : C.panel,
-                  color: athFilterMode === "ath" ? "#06231A" : C.textMuted,
-                  border: `1px solid ${athFilterMode === "ath" ? C.gain : C.border}`,
-                  borderRadius: 8,
-                  padding: "9px 14px",
-                  fontSize: 12.5,
-                  fontWeight: 600,
-                  whiteSpace: "nowrap",
-                }}
-              >
-                Near ATH
-              </button>
-              <button
-                className="ft-btn"
                 onClick={() => toggleAthFilter("atl")}
                 style={{
                   background: athFilterMode === "atl" ? C.loss : C.panel,
@@ -1636,6 +1677,22 @@ export default function FuturesTracker() {
                 }}
               >
                 Near ATL
+              </button>
+              <button
+                className="ft-btn"
+                onClick={() => toggleAthFilter("ath")}
+                style={{
+                  background: athFilterMode === "ath" ? C.gain : C.panel,
+                  color: athFilterMode === "ath" ? "#06231A" : C.textMuted,
+                  border: `1px solid ${athFilterMode === "ath" ? C.gain : C.border}`,
+                  borderRadius: 8,
+                  padding: "9px 14px",
+                  fontSize: 12.5,
+                  fontWeight: 600,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Near ATH
               </button>
             </div>
 
@@ -1678,8 +1735,8 @@ export default function FuturesTracker() {
                     {th("change12h", "12h")}
                     {th("change24h", "24h")}
                     {th("fundingRate", "Funding")}
-                    {th("ath", "ATH")}
                     {th("atl", "ATL")}
+                    {th("ath", "ATH")}
                     <th style={{ position: "sticky", top: 0, background: C.panelAlt, padding: "9px 8px", borderBottom: `1px solid ${C.border}` }}></th>
                   </tr>
                 </thead>
@@ -1822,11 +1879,11 @@ function RowGroup({ r, expanded, onToggleExpand, onToggleWatch, detail, customAl
         <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: mono, color: C.textMuted }}>
           {r.fundingRate !== undefined ? (r.fundingRate * 100).toFixed(4) + "%" : "—"}
         </td>
-        <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: mono, color: C.gain }}>
-          {r.ath !== null ? fmtPrice(r.ath) : "…"}
-        </td>
         <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: mono, color: C.loss }}>
           {r.atl !== null ? fmtPrice(r.atl) : "…"}
+        </td>
+        <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: mono, color: C.gain }}>
+          {r.ath !== null ? fmtPrice(r.ath) : "…"}
         </td>
         <td onClick={onToggleExpand} className="ft-btn" style={{ padding: "8px 8px", textAlign: "center", color: C.textMuted }}>
           {expanded ? "▲" : "▼"}
@@ -2775,10 +2832,23 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
             )
           )}
           {statBox("Reversal", taLoading ? "…" : ta ? <TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} /> : "—")}
-          {statBox("Support", taLoading ? "…" : ta?.support ? fmtPrice(ta.support) : "—", C.gain)}
-          {statBox("Resistance", taLoading ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—", C.loss)}
-          {statBox("All Time High", loading ? "…" : athAtl ? fmtPrice(athAtl.ath) : "—", C.gain)}
-          {statBox("All Time Low", loading ? "…" : athAtl ? fmtPrice(athAtl.atl) : "—", C.loss)}
+          {statBox("▲ Support", taLoading ? "…" : ta?.support ? fmtPrice(ta.support) : "—", C.gain)}
+          {statBox("▼ Resistance", taLoading ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—", C.loss)}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+          <div style={{ background: C.lossBg, borderRadius: 8, padding: "10px 12px" }}>
+            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 2 }}>All Time Low</div>
+            <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.loss }}>
+              {loading ? "…" : athAtl ? fmtPrice(athAtl.atl) : "—"}
+            </div>
+          </div>
+          <div style={{ background: C.gainBg, borderRadius: 8, padding: "10px 12px" }}>
+            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 2 }}>All Time High</div>
+            <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.gain }}>
+              {loading ? "…" : athAtl ? fmtPrice(athAtl.ath) : "—"}
+            </div>
+          </div>
         </div>
 
         <div
@@ -3416,8 +3486,8 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
                 label="Reversal"
                 value={taStatus === "loading" ? "…" : ta ? <TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} /> : "—"}
               />
-              <Stat label="Support" value={taStatus === "loading" ? "…" : ta?.support ? fmtPrice(ta.support) : "—"} color={C.gain} />
-              <Stat label="Resistance" value={taStatus === "loading" ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—"} color={C.loss} />
+              <Stat label="▲ Support" value={taStatus === "loading" ? "…" : ta?.support ? fmtPrice(ta.support) : "—"} color={C.gain} />
+              <Stat label="▼ Resistance" value={taStatus === "loading" ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—"} color={C.loss} />
             </div>
             <div
               onClick={() => setShowHelp((v) => !v)}
@@ -3456,35 +3526,35 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
             {athAtl && !athAtlLoading && (
               <div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
-                  <div style={{ background: C.gainBg, borderRadius: 8, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time High</div>
-                    <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.gain }}>{fmtPrice(athAtl.ath)}</div>
-                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.athTime)}</div>
-                  </div>
                   <div style={{ background: C.lossBg, borderRadius: 8, padding: "10px 12px" }}>
                     <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time Low</div>
                     <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.loss }}>{fmtPrice(athAtl.atl)}</div>
                     <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.atlTime)}</div>
                   </div>
-                  <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>High Close</div>
-                    <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.text }}>{fmtPrice(athAtl.highClose)}</div>
-                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.highCloseTime)}</div>
+                  <div style={{ background: C.gainBg, borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time High</div>
+                    <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.gain }}>{fmtPrice(athAtl.ath)}</div>
+                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.athTime)}</div>
                   </div>
                   <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
                     <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>Low Close</div>
                     <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.text }}>{fmtPrice(athAtl.lowClose)}</div>
                     <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.lowCloseTime)}</div>
                   </div>
+                  <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>High Close</div>
+                    <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: C.text }}>{fmtPrice(athAtl.highClose)}</div>
+                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athAtl.highCloseTime)}</div>
+                  </div>
                 </div>
 
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, fontFamily: mono, marginBottom: 10 }}>
-                  <span style={{ color: C.textMuted }}>Distance from All-Time High</span>
-                  <span style={{ color: pctColor(distFromAth), fontWeight: 700 }}>{fmtPct(distFromAth)}</span>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, fontFamily: mono, marginBottom: 12 }}>
                   <span style={{ color: C.textMuted }}>Distance from All-Time Low</span>
                   <span style={{ color: pctColor(distFromAtl), fontWeight: 700 }}>{fmtPct(distFromAtl)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, fontFamily: mono, marginBottom: 12 }}>
+                  <span style={{ color: C.textMuted }}>Distance from All-Time High</span>
+                  <span style={{ color: pctColor(distFromAth), fontWeight: 700 }}>{fmtPct(distFromAth)}</span>
                 </div>
 
                 <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
@@ -3918,8 +3988,8 @@ function ScreenerPanel({
               <th style={{ padding: "6px 8px" }}>Support</th>
               <th style={{ padding: "6px 8px" }}>Resistance</th>
               <th style={{ padding: "6px 8px" }}>Reversal</th>
-              <th style={{ padding: "6px 8px" }}>ATH</th>
               <th style={{ padding: "6px 8px" }}>ATL</th>
+              <th style={{ padding: "6px 8px" }}>ATH</th>
             </tr>
           </thead>
           <tbody>
@@ -3983,8 +4053,8 @@ function ScreenerPanel({
                       </td>
                     </>
                   )}
-                  <td style={{ padding: "8px 8px" }}>{athAtlCell(r, "ath")}</td>
                   <td style={{ padding: "8px 8px" }}>{athAtlCell(r, "atl")}</td>
+                  <td style={{ padding: "8px 8px" }}>{athAtlCell(r, "ath")}</td>
                 </tr>
               );
             })}
