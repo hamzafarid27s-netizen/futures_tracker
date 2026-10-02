@@ -2745,8 +2745,19 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
           {statBox("All Time High", loading ? "…" : athAtl ? fmtPrice(athAtl.ath) : "—", C.gain)}
           {statBox("All Time Low", loading ? "…" : athAtl ? fmtPrice(athAtl.atl) : "—", C.loss)}
         </div>
+        <TaConditionsNote />
 
-        <div style={{ fontSize: 10.5, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6 }}>
+        <div
+          style={{
+            fontSize: 10.5,
+            fontWeight: 700,
+            color: C.textDim,
+            textTransform: "uppercase",
+            letterSpacing: "0.03em",
+            marginBottom: 6,
+            marginTop: 14,
+          }}
+        >
           ROI% target alerts
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
@@ -3296,6 +3307,7 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
             <Stat label="Support" value={taStatus === "loading" ? "…" : ta?.support ? fmtPrice(ta.support) : "—"} />
             <Stat label="Resistance" value={taStatus === "loading" ? "…" : ta?.resistance ? fmtPrice(ta.resistance) : "—"} />
           </div>
+          <TaConditionsNote />
         </Card>
       )}
 
@@ -3448,6 +3460,33 @@ function reversalTone(r) {
   if (r === "Possible top") return "bear";
   if (r === "Overextended up" || r === "Overextended down") return "warn";
   return "neutral";
+}
+
+// Plain-language breakdown of exactly how Trend/Strength/Momentum/
+// Support/Resistance/Reversal are worked out — the same rules the Screener,
+// Analyze tab, and Tracked Trades all use (identical math client-side and
+// server-side), so numbers never disagree between them.
+function TaConditionsNote() {
+  const row = (label, text) => (
+    <div style={{ marginBottom: 5 }}>
+      <span style={{ color: C.textMuted, fontWeight: 700 }}>{label}</span> — {text}
+    </div>
+  );
+  return (
+    <div style={{ fontSize: 10.5, color: C.textDim, lineHeight: 1.5, borderTop: `1px solid ${C.border}`, marginTop: 12, paddingTop: 10 }}>
+      <div style={{ fontSize: 10.5, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6 }}>
+        How these are worked out (4h candles)
+      </div>
+      {row("Trend", "Up: price above EMA20 above EMA50, gap > 0.15% · Down: price below EMA20 below EMA50, gap < −0.15% · otherwise Sideways")}
+      {row("Strength", "ADX14 — Very strong ≥ 35 · Strong ≥ 25 · Moderate ≥ 15 · Weak < 15")}
+      {row("Momentum", "RSI14 — Overbought ≥ 70 · Bullish ≥ 55 · Neutral 45–55 · Bearish ≤ 45 · Oversold ≤ 30")}
+      {row("Support / Resistance", "lowest low / highest high of the last 60 candles")}
+      {row(
+        "Reversal",
+        "Possible top: RSI ≥ 70 and within 2% of resistance · Possible bottom: RSI ≤ 30 and within 2% of support · Overextended up: RSI ≥ 75 · Overextended down: RSI ≤ 25 · otherwise None"
+      )}
+    </div>
+  );
 }
 
 // How close price has to be to a support/resistance level (either side) to
