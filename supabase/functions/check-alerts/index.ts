@@ -510,21 +510,33 @@ Deno.serve(async (req: Request) => {
     }
 
     // ---- 5. send pushes ----
+    // Logged explicitly (not just counted) because a failed send here is
+    // otherwise invisible — it doesn't throw out of the function, so
+    // nothing else would ever surface *why* a particular alert (e.g. a
+    // tracked-trade touch/funding notification) didn't reach a device.
     let sent = 0;
     let failed = 0;
     for (const f of toFire) {
       const sub = subByDevice[f.deviceId];
-      if (!sub) continue;
+      if (!sub) {
+        console.error(`push skipped (no subscription for device): ${f.deviceId} | ${f.ruleKey}`);
+        continue;
+      }
       try {
         await webpush.sendNotification(
           { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
           JSON.stringify({ title: f.title, body: f.body })
         );
         sent += 1;
+        console.log(`push sent: ${f.deviceId} | ${f.ruleKey} | ${f.title}`);
       } catch (e: any) {
         failed += 1;
+        console.error(
+          `push FAILED: ${f.deviceId} | ${f.ruleKey} | status=${e?.statusCode ?? "?"} | ${e?.body ?? e?.message ?? String(e)}`
+        );
         if (e?.statusCode === 404 || e?.statusCode === 410) {
           toRemoveSubs.push(f.deviceId);
+          console.error(`removing dead subscription for device ${f.deviceId} (${e?.statusCode})`);
         }
       }
     }
@@ -550,6 +562,10 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    if (toFire.length > 0) {
+      console.log(`run summary: fired=${toFire.length} sent=${sent} failed=${failed}`);
+    }
+
     return json({
       ok: true,
       evaluatedDevices: (configs ?? []).length,
@@ -560,6 +576,7 @@ Deno.serve(async (req: Request) => {
       failed,
     });
   } catch (e: any) {
+    console.error(`check-alerts run FAILED: ${e?.message ?? String(e)}`);
     return json({ error: e?.message ?? String(e) }, 500);
   }
 });
