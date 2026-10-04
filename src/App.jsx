@@ -954,15 +954,26 @@ export default function FuturesTracker() {
   }, []);
 
   // ---- tracked trade is about to pay/receive a funding fee ----
-  const fireFundingAlert = useCallback((trade, minutesLeft, rate) => {
+  const fireFundingAlert = useCallback((trade, minutesLeft, rate, markPrice) => {
     const now = Date.now();
+    // Funding paid/received = position notional at mark price x funding rate.
+    // Positive rate: longs pay, shorts receive. Negative rate: reverse.
+    let message = "Funding settlement coming up";
+    if (rate !== null && rate !== undefined && markPrice && trade.entry) {
+      const qty = (trade.margin * trade.leverage) / trade.entry;
+      const fee = qty * markPrice * rate;
+      const youPay = trade.dir === "long" ? fee > 0 : fee < 0;
+      const amt = Math.abs(fee);
+      const amtStr = amt >= 1 ? amt.toFixed(2) : amt.toFixed(4);
+      message = youPay ? `You will pay ${amtStr} USDT as funding fee` : `You will receive ${amtStr} USDT as funding fee`;
+    }
     const event = {
       id: trade.id + "-funding-" + now,
       symbol: trade.symbol,
       minutes: null,
-      label: `Funding fee in ${minutesLeft}m`,
+      label: message,
       thresholdPct: null,
-      actualChange: rate !== null ? rate * 100 : null,
+      actualChange: rate !== null && rate !== undefined ? rate * 100 : null,
       time: now,
       isFlip: true,
     };
@@ -970,7 +981,7 @@ export default function FuturesTracker() {
     if (typeof Notification !== "undefined" && Notification.permission === "granted") {
       try {
         new Notification(`${trade.symbol.replace("USDT", "/USDT")} funding fee in ${minutesLeft}m`, {
-          body: rate !== null ? `Rate ${rate >= 0 ? "+" : ""}${(rate * 100).toFixed(4)}% applies soon` : "Funding settlement coming up",
+          body: message,
         });
       } catch {
         /* notifications unavailable */
@@ -1274,13 +1285,15 @@ export default function FuturesTracker() {
         const key = t.id + ":" + f.nextFundingTime;
         if (fundingAlertFiredRef.current[key]) return;
         fundingAlertFiredRef.current[key] = true;
-        fireFundingAlert(t, Math.max(1, Math.round(msLeft / 60000)), f.rate);
+        const row = rows.find((r) => r.symbol === t.symbol);
+        const mark = row ? parseFloat(row.lastPrice) : null;
+        fireFundingAlert(t, Math.max(1, Math.round(msLeft / 60000)), f.rate, mark);
       });
     };
     check();
     const id = setInterval(check, 15000);
     return () => clearInterval(id);
-  }, [savedTrades, funding, fireFundingAlert]);
+  }, [savedTrades, funding, rows, fireFundingAlert]);
 
   // ---- detail data (full interval grid) for watchlisted / long-interval-alerted / expanded symbols ----
   const monitored = useMemo(() => {

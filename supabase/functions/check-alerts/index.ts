@@ -236,9 +236,23 @@ Deno.serve(async (req: Request) => {
     // reverse transition — true→false (value crossed back through the
     // target) — since those are meant to tell the user both when a target
     // is reached AND when it's given back.
-    const { data: ruleStateRows } = await supabase
-      .from("alert_rule_state")
-      .select("device_id, rule_key, is_active");
+    // Paginated: PostgREST caps a single select at 1000 rows, and this table
+    // grows past that (one row per pair per default rule per device). A
+    // truncated read made later rows (e.g. funding keys) look "never fired"
+    // every run, so they re-notified every minute.
+    const ruleStateRows: Array<{ device_id: string; rule_key: string; is_active: boolean }> = [];
+    for (let from = 0; ; from += 1000) {
+      const { data: page, error: rsErr } = await supabase
+        .from("alert_rule_state")
+        .select("device_id, rule_key, is_active")
+        .order("device_id", { ascending: true })
+        .order("rule_key", { ascending: true })
+        .range(from, from + 999);
+      if (rsErr) throw rsErr;
+      if (!page || page.length === 0) break;
+      ruleStateRows.push(...page);
+      if (page.length < 1000) break;
+    }
     const activeMap: Record<string, boolean> = {};
     (ruleStateRows ?? []).forEach((r: any) => {
       activeMap[`${r.device_id}|${r.rule_key}`] = r.is_active;
@@ -499,10 +513,21 @@ Deno.serve(async (req: Request) => {
             const msLeft = fundingInfo.nextFundingTime - nowMs;
             if (msLeft > 0 && msLeft <= 10 * 60 * 1000) {
               const minutesLeft = Math.max(1, Math.round(msLeft / 60000));
-              evalFundingAlert(deviceId, `funding:${t.id}:${fundingInfo.nextFundingTime}`, () => ({
-                title: `${t.symbol.replace("USDT", "/USDT")} funding fee in ${minutesLeft}m`,
-                body: `Rate ${fundingInfo.rate >= 0 ? "+" : ""}${(fundingInfo.rate * 100).toFixed(4)}% applies soon`,
-              }));
+              evalFundingAlert(deviceId, `funding:${t.id}:${fundingInfo.nextFundingTime}`, () => {
+                // fee = notional at mark price x rate; positive rate: longs
+                // pay / shorts receive, negative rate: the reverse.
+                const qty = t.entry ? (t.margin * t.leverage) / t.entry : 0;
+                const fee = qty * cur * fundingInfo.rate;
+                const youPay = t.dir === "long" ? fee > 0 : fee < 0;
+                const amt = Math.abs(fee);
+                const amtStr = amt >= 1 ? amt.toFixed(2) : amt.toFixed(4);
+                return {
+                  title: `${t.symbol.replace("USDT", "/USDT")} funding fee in ${minutesLeft}m`,
+                  body: youPay
+                    ? `You will pay ${amtStr} USDT as funding fee`
+                    : `You will receive ${amtStr} USDT as funding fee`,
+                };
+              });
             }
           }
         }
