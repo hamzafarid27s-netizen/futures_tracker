@@ -3769,7 +3769,7 @@ const NATIVE_KLINE_MS = {
 };
 const CUSTOM_UNIT_MS = { m: 60000, h: 3600000, d: 86400000, w: 604800000 };
 const MAX_BASE_CANDLES = 6000;
-const DEEP_WARMUP = 100; // extra candles before the window so EMA/ADX/RSI are settled
+const MIN_TA_CANDLES = 6; // fewest candles the indicators can be read from
 
 // Decide which Binance interval to download, and how many of those candles
 // make up one analysis candle.
@@ -3834,10 +3834,11 @@ function aggregateCandles(candles, ratio) {
 
 // Same trend / strength / momentum / support-resistance / reversal rules the
 // Screener uses, run over whatever candles are handed in.
-function computeTaFromCandles(highs, lows, closes) {
+function computeTaFromCandles(highs, lows, closes, opts = {}) {
+  const { emaFast = 20, emaSlow = 50, rsiPeriod = 14, adxPeriod = 14, lookback = 60 } = opts;
   const last = closes[closes.length - 1];
-  const ema20 = emaSeries(closes, 20);
-  const ema50 = emaSeries(closes, 50);
+  const ema20 = emaSeries(closes, emaFast);
+  const ema50 = emaSeries(closes, emaSlow);
   const lastEma20 = ema20[ema20.length - 1];
   const lastEma50 = ema50[ema50.length - 1];
   const emaGapPct = ((lastEma20 - lastEma50) / lastEma50) * 100;
@@ -3846,7 +3847,7 @@ function computeTaFromCandles(highs, lows, closes) {
   if (last > lastEma20 && lastEma20 > lastEma50 && emaGapPct > 0.15) trend = "Up";
   else if (last < lastEma20 && lastEma20 < lastEma50 && emaGapPct < -0.15) trend = "Down";
 
-  const adx = adxValue(highs, lows, closes, 14);
+  const adx = adxValue(highs, lows, closes, adxPeriod);
   let trendStrength = "Weak";
   if (adx !== null) {
     if (adx >= 35) trendStrength = "Very strong";
@@ -3854,7 +3855,7 @@ function computeTaFromCandles(highs, lows, closes) {
     else if (adx >= 15) trendStrength = "Moderate";
   }
 
-  const rsi = rsiValue(closes, 14);
+  const rsi = rsiValue(closes, rsiPeriod);
   let momentum = "Neutral";
   if (rsi !== null) {
     if (rsi >= 70) momentum = "Overbought";
@@ -3863,7 +3864,7 @@ function computeTaFromCandles(highs, lows, closes) {
     else if (rsi <= 45) momentum = "Bearish";
   }
 
-  const { support, resistance } = swingLevels(highs, lows, 60);
+  const { support, resistance } = swingLevels(highs, lows, lookback);
   const nearRes = resistance ? (Math.abs(resistance - last) / last) * 100 : null;
   const nearSup = support ? (Math.abs(last - support) / last) * 100 : null;
 
@@ -4002,6 +4003,14 @@ function DeepAnalysis({ rows, funding, logos }) {
     return rows.find((r) => r.symbol === full) || null;
   }, [symbolText, rows]);
 
+  // Shown under the candle-count box before anything is run.
+  const previewMs = useMemo(() => {
+    const plan = planKlines(intervalKey, customAmount, customUnit);
+    const n = Math.round(Number(count));
+    if (!plan || !n || n < 1) return null;
+    return plan.ms * n;
+  }, [intervalKey, customAmount, customUnit, count]);
+
   const run = async () => {
     setError(null);
     if (!matchedRow) {
@@ -4018,16 +4027,15 @@ function DeepAnalysis({ rows, funding, logos }) {
       setError("Enter how many candles to analyse (at least 2).");
       return;
     }
-    const warm = DEEP_WARMUP;
-    const need = (n + warm) * plan.ratio;
+    const need = n * plan.ratio;
     if (need > MAX_BASE_CANDLES) {
       setError(
         plan.ratio > 1
           ? `That custom interval needs ${need.toLocaleString()} small candles — reduce the candle count (max about ${Math.max(
               1,
-              Math.floor(MAX_BASE_CANDLES / plan.ratio) - warm
+              Math.floor(MAX_BASE_CANDLES / plan.ratio)
             )}).`
-          : `Too many candles — keep it under ${MAX_BASE_CANDLES - warm}.`
+          : `Too many candles — keep it under ${MAX_BASE_CANDLES}.`
       );
       return;
     }
@@ -4042,9 +4050,19 @@ function DeepAnalysis({ rows, funding, logos }) {
       const candles = aggregateCandles(baseCandles, plan.ratio);
       if (candles.length < 2) throw new Error("Binance has too little history for this pair at that interval.");
       const win = candles.slice(-n);
-      const highs = candles.map((k) => parseFloat(k[2]));
-      const lows = candles.map((k) => parseFloat(k[3]));
-      const closes = candles.map((k) => parseFloat(k[4]));
+      // Everything below reads ONLY the candles in the chosen duration, so a
+      // short window and a long window give genuinely different answers.
+      const highs = win.map((k) => parseFloat(k[2]));
+      const lows = win.map((k) => parseFloat(k[3]));
+      const closes = win.map((k) => parseFloat(k[4]));
+      const wn = win.length;
+      const taParams = {
+        emaSlow: Math.max(3, Math.min(50, Math.round(wn / 2))),
+        rsiPeriod: Math.max(2, Math.min(14, wn - 1)),
+        adxPeriod: Math.max(2, Math.min(14, Math.floor(wn / 2))),
+        lookback: wn,
+      };
+      taParams.emaFast = Math.max(2, Math.round(taParams.emaSlow * 0.4));
 
       let hiIdx = 0, loIdx = 0;
       win.forEach((k, i) => {
@@ -4066,7 +4084,8 @@ function DeepAnalysis({ rows, funding, logos }) {
         lowTime: win[loIdx][0],
         changePct: ((closeLast - openFirst) / openFirst) * 100,
         quoteVolume: win.reduce((a, k) => a + parseFloat(k[7]), 0),
-        ta: candles.length >= 15 ? computeTaFromCandles(highs, lows, closes) : null,
+        ta: wn >= MIN_TA_CANDLES ? computeTaFromCandles(highs, lows, closes, taParams) : null,
+        taParams,
       };
 
       const [extrasS, posS, fundS] = await Promise.allSettled([
@@ -4171,6 +4190,15 @@ function DeepAnalysis({ rows, funding, logos }) {
             placeholder="e.g. 100"
             style={inputStyle}
           />
+          {previewMs !== null && (
+            <div style={{ fontSize: 12, color: C.textMuted, marginTop: 8, fontFamily: mono }}>
+              Duration of analysis:{" "}
+              <span style={{ color: C.amber, fontWeight: 700 }}>
+                {intervalKey === "1M" ? "≈ " : ""}
+                {fmtDuration(previewMs)}
+              </span>
+            </div>
+          )}
         </Field>
 
         <button
@@ -4288,16 +4316,30 @@ function DeepAnalysis({ rows, funding, logos }) {
                   <span>{showHelp ? "▾" : "▸"}</span> How these are worked out
                 </div>
                 {showHelp && (
-                  <>
-                    <TaConditionsNote />
-                    <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 6 }}>
-                      Here the same rules run on your chosen {result.intervalLabel} candles (plus {DEEP_WARMUP} earlier candles so the indicators are settled).
+                  <div style={{ fontSize: 10.5, color: C.textDim, lineHeight: 1.5, borderTop: `1px solid ${C.border}`, marginTop: 12, paddingTop: 10 }}>
+                    <div style={{ marginBottom: 5 }}>
+                      Worked out only from the {result.actual} × {result.intervalLabel} candles in your duration, so changing the duration changes these.
                     </div>
-                  </>
+                    <div style={{ marginBottom: 5 }}>
+                      <span style={{ color: C.textMuted, fontWeight: 700 }}>Trend</span> — EMA{result.taParams.emaFast} vs EMA{result.taParams.emaSlow} (scaled down for short durations): Up when price &gt; fast &gt; slow with a gap over 0.15%, Down when the opposite, otherwise Sideways
+                    </div>
+                    <div style={{ marginBottom: 5 }}>
+                      <span style={{ color: C.textMuted, fontWeight: 700 }}>Strength</span> — ADX{result.taParams.adxPeriod}: Very strong ≥ 35 · Strong ≥ 25 · Moderate ≥ 15 · Weak below
+                    </div>
+                    <div style={{ marginBottom: 5 }}>
+                      <span style={{ color: C.textMuted, fontWeight: 700 }}>Momentum</span> — RSI{result.taParams.rsiPeriod}: Overbought ≥ 70 · Bullish ≥ 55 · Neutral · Bearish ≤ 45 · Oversold ≤ 30
+                    </div>
+                    <div style={{ marginBottom: 5 }}>
+                      <span style={{ color: C.textMuted, fontWeight: 700 }}>Support / Resistance</span> — lowest low / highest high of the whole duration
+                    </div>
+                    <div>
+                      <span style={{ color: C.textMuted, fontWeight: 700 }}>Reversal</span> — Possible top: RSI ≥ 70 and within 2% of resistance · Possible bottom: RSI ≤ 30 and within 2% of support · Overextended: RSI ≥ 75 / ≤ 25
+                    </div>
+                  </div>
                 )}
               </>
             ) : (
-              <div style={{ fontSize: 12, color: C.textDim }}>Not enough candles for trend / strength / momentum on this pair.</div>
+              <div style={{ fontSize: 12, color: C.textDim }}>Use at least {MIN_TA_CANDLES} candles to get trend / strength / momentum for this duration.</div>
             )}
           </div>
 
