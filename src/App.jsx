@@ -310,7 +310,7 @@ function getDeviceId() {
 }
 
 export default function FuturesTracker() {
-  const [tab, setTab] = useState("market"); // market | analyze | alerts
+  const [tab, setTab] = useState("market"); // market | analyze | trades | screener | alerts
   const [themeMode, setThemeMode] = useState("dark");
   const [showSettings, setShowSettings] = useState(false);
   const [rows, setRows] = useState([]); // ticker rows
@@ -1669,7 +1669,7 @@ export default function FuturesTracker() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${C.border}` }}>
-          {["market", "analyze", "screener", "alerts"].map((t) => (
+          {["market", "analyze", "trades", "screener", "alerts"].map((t) => (
             <div
               key={t}
               className="ft-tab"
@@ -1684,7 +1684,11 @@ export default function FuturesTracker() {
                 textTransform: "capitalize",
               }}
             >
-              {t === "alerts" && triggered.length > 0 ? `Alerts · ${triggered.length}` : t}
+              {t === "alerts" && triggered.length > 0
+                ? `Alerts · ${triggered.length}`
+                : t === "trades" && savedTrades.length > 0
+                ? `Trades · ${savedTrades.length}`
+                : t}
             </div>
           ))}
         </div>
@@ -1856,6 +1860,18 @@ export default function FuturesTracker() {
             savedTrades={savedTrades}
             setSavedTrades={setSavedTrades}
             logos={coinLogos}
+            goToTrades={() => setTab("trades")}
+          />
+        )}
+
+        {tab === "trades" && (
+          <TradesTab
+            rows={rows}
+            funding={funding}
+            logos={coinLogos}
+            savedTrades={savedTrades}
+            setSavedTrades={setSavedTrades}
+            goToAnalyze={() => setTab("analyze")}
           />
         )}
 
@@ -2413,64 +2429,9 @@ async function fetchTAForSymbol(symbol) {
   const highs = data.map((k) => parseFloat(k[2]));
   const lows = data.map((k) => parseFloat(k[3]));
   const closes = data.map((k) => parseFloat(k[4]));
-  const last = closes[closes.length - 1];
-
-  const ema20 = emaSeries(closes, 20);
-  const ema50 = emaSeries(closes, 50);
-  const lastEma20 = ema20[ema20.length - 1];
-  const lastEma50 = ema50[ema50.length - 1];
-  const emaGapPct = ((lastEma20 - lastEma50) / lastEma50) * 100;
-
-  let trend = "Sideways";
-  if (last > lastEma20 && lastEma20 > lastEma50 && emaGapPct > 0.15) trend = "Up";
-  else if (last < lastEma20 && lastEma20 < lastEma50 && emaGapPct < -0.15) trend = "Down";
-
-  const adx = adxValue(highs, lows, closes, 14);
-  let trendStrength = "Weak";
-  if (adx !== null) {
-    if (adx >= 35) trendStrength = "Very strong";
-    else if (adx >= 25) trendStrength = "Strong";
-    else if (adx >= 15) trendStrength = "Moderate";
-  }
-
-  const rsi = rsiValue(closes, 14);
-  let momentum = "Neutral";
-  if (rsi !== null) {
-    if (rsi >= 70) momentum = "Overbought";
-    else if (rsi >= 55) momentum = "Bullish";
-    else if (rsi <= 30) momentum = "Oversold";
-    else if (rsi <= 45) momentum = "Bearish";
-  }
-
-  const { support, resistance } = swingLevels(highs, lows, 60);
-  // Absolute distance either direction — price can sit just above OR just
-  // below a level (briefly poking through it) and still be "near" it.
-  const nearRes = resistance ? (Math.abs(resistance - last) / last) * 100 : null;
-  const nearSup = support ? (Math.abs(last - support) / last) * 100 : null;
-
-  // Reversal: RSI at an extreme while price sits close to the level that
-  // would make that extreme meaningful (overbought near resistance in an
-  // uptrend, oversold near support in a downtrend).
-  let reversal = "None";
-  if (rsi !== null) {
-    if (rsi >= 70 && nearRes !== null && nearRes <= 2) reversal = "Possible top";
-    else if (rsi <= 30 && nearSup !== null && nearSup <= 2) reversal = "Possible bottom";
-    else if (rsi >= 75) reversal = "Overextended up";
-    else if (rsi <= 25) reversal = "Overextended down";
-  }
-
   return {
-    trend,
-    trendStrength,
-    adx,
-    momentum,
-    rsi,
-    support,
-    resistance,
-    nearSupportPct: nearSup,
-    nearResistancePct: nearRes,
-    reversal,
-    price: last,
+    ...computeTaFromCandles(highs, lows, closes),
+    price: closes[closes.length - 1],
     updatedAt: Date.now(),
   };
 }
@@ -3067,7 +3028,9 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
   );
 }
 
-function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrades, setSavedTrades, logos }) {
+function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrades, setSavedTrades, logos, goToTrades }) {
+  const [section, setSection] = useState("setup"); // setup | deep
+  const [justTracked, setJustTracked] = useState(null); // symbol just added to Trades
   const [form, setForm] = useState({ symbol: "", entry: "", margin: "", leverage: 10, dir: "long" });
   const [extras, setExtras] = useState(null);
   const [extrasStatus, setExtrasStatus] = useState("idle"); // idle | loading | live | error
@@ -3285,30 +3248,43 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
       };
       return next;
     });
+    setJustTracked(matchedRow.symbol);
   };
-  const removeTrade = (id) => setSavedTrades((prev) => prev.filter((t) => t.id !== id));
-  const addRoiAlert = (tradeId, pct) =>
-    setSavedTrades((prev) =>
-      prev.map((t) => (t.id === tradeId ? { ...t, roiAlerts: [...(t.roiAlerts || []), { id: "ra-" + Date.now(), pct }] } : t))
-    );
-  const removeRoiAlert = (tradeId, alertId) =>
-    setSavedTrades((prev) =>
-      prev.map((t) => (t.id === tradeId ? { ...t, roiAlerts: (t.roiAlerts || []).filter((a) => a.id !== alertId) } : t))
-    );
-  const addPnlAlert = (tradeId, value) =>
-    setSavedTrades((prev) =>
-      prev.map((t) => (t.id === tradeId ? { ...t, pnlAlerts: [...(t.pnlAlerts || []), { id: "pa-" + Date.now(), value }] } : t))
-    );
-  const removePnlAlert = (tradeId, alertId) =>
-    setSavedTrades((prev) =>
-      prev.map((t) => (t.id === tradeId ? { ...t, pnlAlerts: (t.pnlAlerts || []).filter((a) => a.id !== alertId) } : t))
-    );
 
   const distFromAth = current && athAtl?.ath ? ((current - athAtl.ath) / athAtl.ath) * 100 : null;
   const distFromAtl = current && athAtl?.atl ? ((current - athAtl.atl) / athAtl.atl) * 100 : null;
 
   return (
     <div style={{ maxWidth: 480 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+        {[
+          ["setup", "Trade Setup"],
+          ["deep", "Deep Analysis"],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            className="ft-btn"
+            onClick={() => setSection(key)}
+            style={{
+              flex: 1,
+              background: section === key ? C.amber : C.panel,
+              color: section === key ? "#1A1300" : C.textMuted,
+              border: `1px solid ${section === key ? C.amber : C.border}`,
+              borderRadius: 8,
+              padding: "10px",
+              fontSize: 13,
+              fontWeight: 700,
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {section === "deep" && <DeepAnalysis rows={rows} funding={funding} logos={logos} />}
+
+      {section === "setup" && (
+        <>
       <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 16 }}>
         Enter a trade you've opened elsewhere to get a live read on it. This is an automated summary of public market data, not financial advice.
       </div>
@@ -3501,6 +3477,18 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
             ) : null
           }
         >
+          {justTracked === matchedRow.symbol && (
+            <div style={{ fontSize: 12.5, color: C.gain, marginBottom: 12, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <span>✓ Added to Trades.</span>
+              <button
+                onClick={goToTrades}
+                className="ft-btn"
+                style={{ background: "transparent", color: C.amber, border: `1px solid ${C.amber}`, borderRadius: 6, padding: "3px 10px", fontSize: 11, fontWeight: 600 }}
+              >
+                View in Trades
+              </button>
+            </div>
+          )}
           {entryNum > 0 && pnlUsdt !== null && (
             <div style={{ paddingBottom: 14, marginBottom: 14, borderBottom: `1px solid ${C.border}` }}>
               <div style={{ display: "flex", gap: 24, marginBottom: 16 }}>
@@ -3695,30 +3683,707 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
 
       {matchedRow && <MultiExchangePanel multiExchange={extras?.multiExchange} />}
 
-      {savedTrades.length > 0 && (
-        <Card title="Tracked Trades — tap to expand">
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {savedTrades.map((t) => (
-              <TrackedTradeRow
-                key={t.id}
-                t={t}
-                row={rows.find((r) => r.symbol === t.symbol)}
-                funding={funding}
-                logos={logos}
-                onRemove={removeTrade}
-                onAddRoiAlert={addRoiAlert}
-                onRemoveRoiAlert={removeRoiAlert}
-                onAddPnlAlert={addPnlAlert}
-                onRemovePnlAlert={removePnlAlert}
-              />
-            ))}
-          </div>
-        </Card>
+        </>
       )}
     </div>
   );
 }
 
+
+
+// ---------------------------------------------------------------------------
+// Trades tab — the user's tracked trades (set up in Analyze → Trade Setup).
+// ---------------------------------------------------------------------------
+function TradesTab({ rows, funding, logos, savedTrades, setSavedTrades, goToAnalyze }) {
+  const removeTrade = (id) => setSavedTrades((prev) => prev.filter((t) => t.id !== id));
+  const addRoiAlert = (tradeId, pct) =>
+    setSavedTrades((prev) =>
+      prev.map((t) => (t.id === tradeId ? { ...t, roiAlerts: [...(t.roiAlerts || []), { id: "ra-" + Date.now(), pct }] } : t))
+    );
+  const removeRoiAlert = (tradeId, alertId) =>
+    setSavedTrades((prev) =>
+      prev.map((t) => (t.id === tradeId ? { ...t, roiAlerts: (t.roiAlerts || []).filter((a) => a.id !== alertId) } : t))
+    );
+  const addPnlAlert = (tradeId, value) =>
+    setSavedTrades((prev) =>
+      prev.map((t) => (t.id === tradeId ? { ...t, pnlAlerts: [...(t.pnlAlerts || []), { id: "pa-" + Date.now(), value }] } : t))
+    );
+  const removePnlAlert = (tradeId, alertId) =>
+    setSavedTrades((prev) =>
+      prev.map((t) => (t.id === tradeId ? { ...t, pnlAlerts: (t.pnlAlerts || []).filter((a) => a.id !== alertId) } : t))
+    );
+
+  if (savedTrades.length === 0) {
+    return (
+      <div style={{ maxWidth: 480 }}>
+        <Card title="Trades">
+          <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginBottom: 12 }}>
+            No tracked trades yet. Set one up in Analyze → Trade Setup, then tap "+ Track for flip alerts" and it will show up here.
+          </div>
+          <button
+            onClick={goToAnalyze}
+            className="ft-btn"
+            style={{ background: C.amber, color: "#1A1300", border: "none", borderRadius: 8, padding: "10px 14px", fontSize: 13, fontWeight: 700 }}
+          >
+            Go to Analyze
+          </button>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ maxWidth: 480 }}>
+      <Card title={`Tracked Trades · ${savedTrades.length}`}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {savedTrades.map((t) => (
+            <TrackedTradeRow
+              key={t.id}
+              t={t}
+              row={rows.find((r) => r.symbol === t.symbol)}
+              funding={funding}
+              logos={logos}
+              onRemove={removeTrade}
+              onAddRoiAlert={addRoiAlert}
+              onRemoveRoiAlert={removeRoiAlert}
+              onAddPnlAlert={addPnlAlert}
+              onRemovePnlAlert={removePnlAlert}
+            />
+          ))}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Deep Analysis helpers
+// ---------------------------------------------------------------------------
+const DEEP_INTERVALS = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "1w", "1M"];
+// Binance's own kline intervals (ms) — anything else a user asks for under
+// "Custom" is built by merging smaller candles.
+const NATIVE_KLINE_MS = {
+  "1m": 60000, "3m": 180000, "5m": 300000, "15m": 900000, "30m": 1800000,
+  "1h": 3600000, "2h": 7200000, "4h": 14400000, "6h": 21600000, "8h": 28800000,
+  "12h": 43200000, "1d": 86400000, "3d": 259200000, "1w": 604800000, "1M": 2592000000,
+};
+const CUSTOM_UNIT_MS = { m: 60000, h: 3600000, d: 86400000, w: 604800000 };
+const MAX_BASE_CANDLES = 6000;
+const DEEP_WARMUP = 100; // extra candles before the window so EMA/ADX/RSI are settled
+
+// Decide which Binance interval to download, and how many of those candles
+// make up one analysis candle.
+function planKlines(intervalKey, customAmount, customUnit) {
+  if (intervalKey !== "custom") return { base: intervalKey, ratio: 1, ms: NATIVE_KLINE_MS[intervalKey], label: intervalKey };
+  const amount = Math.round(Number(customAmount));
+  const ms = amount * (CUSTOM_UNIT_MS[customUnit] || 0);
+  if (!amount || amount < 1 || ms < 60000) return null;
+  const label = `${amount}${customUnit}`;
+  const exact = Object.keys(NATIVE_KLINE_MS).find((k) => NATIVE_KLINE_MS[k] === ms && k !== "1M");
+  if (exact) return { base: exact, ratio: 1, ms, label };
+  const bases = ["1d", "12h", "8h", "6h", "4h", "2h", "1h", "30m", "15m", "5m", "3m", "1m"];
+  const base = bases.find((b) => ms % NATIVE_KLINE_MS[b] === 0);
+  return { base, ratio: ms / NATIVE_KLINE_MS[base], ms, label };
+}
+
+// Downloads the most recent n candles, paging backwards (Binance returns at
+// most 1500 per request).
+async function fetchKlinesN(symbol, interval, n) {
+  const out = [];
+  let endTime = null;
+  while (out.length < n) {
+    const limit = Math.min(1500, n - out.length);
+    const url =
+      `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}` +
+      (endTime ? `&endTime=${endTime}` : "");
+    // eslint-disable-next-line no-await-in-loop
+    const res = await fapiFetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    // eslint-disable-next-line no-await-in-loop
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) break;
+    out.unshift(...data);
+    endTime = data[0][0] - 1;
+    if (data.length < limit) break;
+  }
+  return out;
+}
+
+// Merges `ratio` small candles into one, counting back from the newest so the
+// latest candle is always complete-aligned to "now".
+function aggregateCandles(candles, ratio) {
+  if (ratio === 1) return candles;
+  const groups = Math.floor(candles.length / ratio);
+  const start = candles.length - groups * ratio;
+  const out = [];
+  for (let g = 0; g < groups; g++) {
+    const s = candles.slice(start + g * ratio, start + (g + 1) * ratio);
+    out.push([
+      s[0][0],
+      s[0][1],
+      Math.max(...s.map((k) => parseFloat(k[2]))),
+      Math.min(...s.map((k) => parseFloat(k[3]))),
+      s[s.length - 1][4],
+      s.reduce((a, k) => a + parseFloat(k[5]), 0),
+      s[s.length - 1][6],
+      s.reduce((a, k) => a + parseFloat(k[7]), 0),
+    ]);
+  }
+  return out;
+}
+
+// Same trend / strength / momentum / support-resistance / reversal rules the
+// Screener uses, run over whatever candles are handed in.
+function computeTaFromCandles(highs, lows, closes) {
+  const last = closes[closes.length - 1];
+  const ema20 = emaSeries(closes, 20);
+  const ema50 = emaSeries(closes, 50);
+  const lastEma20 = ema20[ema20.length - 1];
+  const lastEma50 = ema50[ema50.length - 1];
+  const emaGapPct = ((lastEma20 - lastEma50) / lastEma50) * 100;
+
+  let trend = "Sideways";
+  if (last > lastEma20 && lastEma20 > lastEma50 && emaGapPct > 0.15) trend = "Up";
+  else if (last < lastEma20 && lastEma20 < lastEma50 && emaGapPct < -0.15) trend = "Down";
+
+  const adx = adxValue(highs, lows, closes, 14);
+  let trendStrength = "Weak";
+  if (adx !== null) {
+    if (adx >= 35) trendStrength = "Very strong";
+    else if (adx >= 25) trendStrength = "Strong";
+    else if (adx >= 15) trendStrength = "Moderate";
+  }
+
+  const rsi = rsiValue(closes, 14);
+  let momentum = "Neutral";
+  if (rsi !== null) {
+    if (rsi >= 70) momentum = "Overbought";
+    else if (rsi >= 55) momentum = "Bullish";
+    else if (rsi <= 30) momentum = "Oversold";
+    else if (rsi <= 45) momentum = "Bearish";
+  }
+
+  const { support, resistance } = swingLevels(highs, lows, 60);
+  const nearRes = resistance ? (Math.abs(resistance - last) / last) * 100 : null;
+  const nearSup = support ? (Math.abs(last - support) / last) * 100 : null;
+
+  let reversal = "None";
+  if (rsi !== null) {
+    if (rsi >= 70 && nearRes !== null && nearRes <= 2) reversal = "Possible top";
+    else if (rsi <= 30 && nearSup !== null && nearSup <= 2) reversal = "Possible bottom";
+    else if (rsi >= 75) reversal = "Overextended up";
+    else if (rsi <= 25) reversal = "Overextended down";
+  }
+  return { trend, trendStrength, adx, momentum, rsi, support, resistance, nearSupportPct: nearSup, nearResistancePct: nearRes, reversal };
+}
+
+function fmtDuration(ms) {
+  const trim = (n) => (Math.abs(n - Math.round(n)) < 0.05 ? String(Math.round(n)) : n.toFixed(1));
+  const min = ms / 60000;
+  if (min < 60) return `${trim(min)} ${Math.round(min) === 1 ? "minute" : "minutes"}`;
+  const h = min / 60;
+  if (h < 24) return `${trim(h)} hours`;
+  const d = h / 24;
+  if (d < 14) return `${trim(d)} days`;
+  if (d < 60) return `${trim(d / 7)} weeks`;
+  if (d < 730) return `${trim(d / 30.4375)} months`;
+  return `${trim(d / 365.25)} years`;
+}
+
+// Compact volume: 1K, 12.5K, 1M, 1.2B — one decimal at most, no trailing .0
+function fmtVol(n) {
+  const num = Number(n);
+  if (!isFinite(num)) return "—";
+  const abs = Math.abs(num);
+  const t = (v) => v.toFixed(1).replace(/\.0$/, "");
+  if (abs >= 1e12) return t(num / 1e12) + "T";
+  if (abs >= 1e9) return t(num / 1e9) + "B";
+  if (abs >= 1e6) return t(num / 1e6) + "M";
+  if (abs >= 1e3) return t(num / 1e3) + "K";
+  return t(num);
+}
+
+let fundingIntervalCache = null; // symbol -> hours, for pairs Binance has moved off the default 8h
+async function getFundingIntervalHours(symbol) {
+  if (!fundingIntervalCache) {
+    fundingIntervalCache = {};
+    try {
+      const res = await fapiFetch("https://fapi.binance.com/fapi/v1/fundingInfo");
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) data.forEach((d) => (fundingIntervalCache[d.symbol] = Number(d.fundingIntervalHours)));
+      } else {
+        fundingIntervalCache = null;
+      }
+    } catch {
+      fundingIntervalCache = null;
+    }
+  }
+  return (fundingIntervalCache && fundingIntervalCache[symbol]) || 8;
+}
+
+const LS_PERIODS = [
+  ["5m", 300000], ["15m", 900000], ["30m", 1800000], ["1h", 3600000], ["2h", 7200000],
+  ["4h", 14400000], ["6h", 21600000], ["12h", 43200000], ["1d", 86400000],
+];
+
+// Long/short ratios + open-interest history over the analysed window, from
+// Binance's public futures-data endpoints (Binance only keeps ~30 days).
+async function fetchPositioning(symbol, windowMs) {
+  let period = LS_PERIODS[0];
+  LS_PERIODS.forEach((p) => {
+    if (p[1] <= Math.max(windowMs / 2, 300000)) period = p;
+  });
+  const limit = Math.max(2, Math.min(500, Math.round(windowMs / period[1])));
+  const get = (path) =>
+    fapiFetch(`https://fapi.binance.com/futures/data/${path}?symbol=${symbol}&period=${period[0]}&limit=${limit}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+  const [global, top, oiHist] = await Promise.all([
+    get("globalLongShortAccountRatio"),
+    get("topLongShortPositionRatio"),
+    get("openInterestHist"),
+  ]);
+  const lastOf = (a) => (Array.isArray(a) && a.length ? a[a.length - 1] : null);
+  const g = lastOf(global);
+  const tp = lastOf(top);
+  const avgRatio = Array.isArray(global) && global.length ? global.reduce((s, x) => s + parseFloat(x.longShortRatio), 0) / global.length : null;
+  let oiChangePct = null;
+  if (Array.isArray(oiHist) && oiHist.length >= 2) {
+    const first = parseFloat(oiHist[0].sumOpenInterestValue);
+    const last = parseFloat(oiHist[oiHist.length - 1].sumOpenInterestValue);
+    if (first > 0) oiChangePct = ((last - first) / first) * 100;
+  }
+  return {
+    period: period[0],
+    covered: Array.isArray(global) ? global.length : 0,
+    requested: limit,
+    globalLongPct: g ? parseFloat(g.longAccount) * 100 : null,
+    globalShortPct: g ? parseFloat(g.shortAccount) * 100 : null,
+    globalRatio: g ? parseFloat(g.longShortRatio) : null,
+    avgRatio,
+    topLongPct: tp ? parseFloat(tp.longAccount) * 100 : null,
+    topShortPct: tp ? parseFloat(tp.shortAccount) * 100 : null,
+    topRatio: tp ? parseFloat(tp.longShortRatio) : null,
+    oiChangePct,
+  };
+}
+
+function positioningRead(priceChangePct, oiChangePct) {
+  if (oiChangePct === null || priceChangePct === null) return null;
+  const pUp = priceChangePct > 0.1;
+  const pDown = priceChangePct < -0.1;
+  const oUp = oiChangePct > 0.5;
+  const oDown = oiChangePct < -0.5;
+  if (pUp && oUp) return { text: "New longs entering — trend is being built with fresh money", tone: "bull" };
+  if (pUp && oDown) return { text: "Shorts closing — rise driven by short covering, not new buyers", tone: "warn" };
+  if (pDown && oUp) return { text: "New shorts entering — fresh selling pressure", tone: "bear" };
+  if (pDown && oDown) return { text: "Longs closing — liquidation / capitulation, not new shorts", tone: "warn" };
+  return { text: "Price or open interest roughly flat — no clear positioning shift", tone: "neutral" };
+}
+
+function DeepAnalysis({ rows, funding, logos }) {
+  const [symbolText, setSymbolText] = useState("");
+  const [intervalKey, setIntervalKey] = useState("1h");
+  const [customAmount, setCustomAmount] = useState("");
+  const [customUnit, setCustomUnit] = useState("h");
+  const [count, setCount] = useState("100");
+  const [status, setStatus] = useState("idle"); // idle | loading | done | error
+  const [error, setError] = useState(null);
+  const [result, setResult] = useState(null);
+  const [athState, setAthState] = useState({ status: "idle", data: null });
+  const [showHelp, setShowHelp] = useState(false);
+  const runId = useRef(0);
+
+  const matchedRow = useMemo(() => {
+    const sym = symbolText.trim().toUpperCase();
+    if (!sym) return null;
+    const full = sym.endsWith("USDT") ? sym : sym + "USDT";
+    return rows.find((r) => r.symbol === full) || null;
+  }, [symbolText, rows]);
+
+  const run = async () => {
+    setError(null);
+    if (!matchedRow) {
+      setError("Type or pick a pair that's on the list, e.g. BTC.");
+      return;
+    }
+    const plan = planKlines(intervalKey, customAmount, customUnit);
+    if (!plan) {
+      setError("Enter a custom interval of at least 1 minute, e.g. 7 and h.");
+      return;
+    }
+    const n = Math.round(Number(count));
+    if (!n || n < 2) {
+      setError("Enter how many candles to analyse (at least 2).");
+      return;
+    }
+    const warm = DEEP_WARMUP;
+    const need = (n + warm) * plan.ratio;
+    if (need > MAX_BASE_CANDLES) {
+      setError(
+        plan.ratio > 1
+          ? `That custom interval needs ${need.toLocaleString()} small candles — reduce the candle count (max about ${Math.max(
+              1,
+              Math.floor(MAX_BASE_CANDLES / plan.ratio) - warm
+            )}).`
+          : `Too many candles — keep it under ${MAX_BASE_CANDLES - warm}.`
+      );
+      return;
+    }
+
+    const id = ++runId.current;
+    const symbol = matchedRow.symbol;
+    setStatus("loading");
+    setResult(null);
+    setAthState({ status: "idle", data: null });
+    try {
+      const baseCandles = await fetchKlinesN(symbol, plan.base, need);
+      const candles = aggregateCandles(baseCandles, plan.ratio);
+      if (candles.length < 2) throw new Error("Binance has too little history for this pair at that interval.");
+      const win = candles.slice(-n);
+      const highs = candles.map((k) => parseFloat(k[2]));
+      const lows = candles.map((k) => parseFloat(k[3]));
+      const closes = candles.map((k) => parseFloat(k[4]));
+
+      let hiIdx = 0, loIdx = 0;
+      win.forEach((k, i) => {
+        if (parseFloat(k[2]) > parseFloat(win[hiIdx][2])) hiIdx = i;
+        if (parseFloat(k[3]) < parseFloat(win[loIdx][3])) loIdx = i;
+      });
+      const openFirst = parseFloat(win[0][1]);
+      const closeLast = parseFloat(win[win.length - 1][4]);
+      const durationMs = win[win.length - 1][6] + 1 - win[0][0];
+      const stats = {
+        symbol,
+        intervalLabel: plan.label,
+        requested: n,
+        actual: win.length,
+        durationMs,
+        high: parseFloat(win[hiIdx][2]),
+        highTime: win[hiIdx][0],
+        low: parseFloat(win[loIdx][3]),
+        lowTime: win[loIdx][0],
+        changePct: ((closeLast - openFirst) / openFirst) * 100,
+        quoteVolume: win.reduce((a, k) => a + parseFloat(k[7]), 0),
+        ta: candles.length >= 15 ? computeTaFromCandles(highs, lows, closes) : null,
+      };
+
+      const [extrasS, posS, fundS] = await Promise.allSettled([
+        fetchAnalysisExtras(symbol),
+        fetchPositioning(symbol, durationMs),
+        getFundingIntervalHours(symbol),
+      ]);
+      if (id !== runId.current) return;
+      stats.oi = extrasS.status === "fulfilled" ? extrasS.value?.multiExchange?.binance?.oi ?? null : null;
+      stats.positioning = posS.status === "fulfilled" ? posS.value : null;
+      stats.fundingHours = fundS.status === "fulfilled" ? fundS.value : 8;
+      setResult(stats);
+      setStatus("done");
+
+      // All-time high/low shares the same on-device cache as the rest of the app
+      setAthState({ status: "loading", data: null });
+      try {
+        const cacheMap = (await safeStorageGet("ath-atl-cache")) || {};
+        const key = symbol + "|1d";
+        const res = await fetchTrueAthAtl(symbol, "1d", cacheMap[key], () => {});
+        cacheMap[key] = { interval: "1d", ...res };
+        await safeStorageSet("ath-atl-cache", cacheMap);
+        if (id === runId.current) setAthState({ status: "done", data: res });
+      } catch {
+        if (id === runId.current) setAthState({ status: "error", data: null });
+      }
+    } catch (e) {
+      if (id !== runId.current) return;
+      setError(e.message || "Couldn't load that analysis — Binance may be rate-limiting, try again shortly.");
+      setStatus("error");
+    }
+  };
+
+  const live = result ? rows.find((r) => r.symbol === result.symbol) : null;
+  const currentPrice = live ? parseFloat(live.lastPrice) : null;
+  const f = result ? funding[result.symbol] : null;
+  const ta = result?.ta;
+  const pos = result?.positioning;
+  const read = pos ? positioningRead(result.changePct, pos.oiChangePct) : null;
+  const toneColor = (tone) => ({ bull: C.gain, bear: C.loss, warn: C.amber }[tone] || C.textMuted);
+
+  const Item = ({ label, value, sub, color }) => (
+    <div>
+      <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 2 }}>{label}</div>
+      <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: color || C.text }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: C.textDim, marginTop: 2, fontFamily: mono }}>{sub}</div>}
+    </div>
+  );
+  const sectionStyle = { paddingBottom: 14, marginBottom: 14, borderBottom: `1px solid ${C.border}` };
+  const grid = { display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 14, columnGap: 10 };
+  const inputStyle = { ...selStyle(), padding: "10px 12px", width: "100%", boxSizing: "border-box", fontSize: 13 };
+
+  return (
+    <>
+      <Card title="Deep Analysis">
+        <Field label="Pair">
+          <SymbolPicker
+            rows={rows}
+            logos={logos}
+            value={symbolText}
+            onChange={(v) => setSymbolText(v)}
+            onSelect={(sym) => setSymbolText(sym.replace("USDT", ""))}
+            placeholder="Pair, e.g. BTC — tap to browse"
+          />
+        </Field>
+
+        <Field label="Candle interval (K-line)">
+          <select value={intervalKey} onChange={(e) => setIntervalKey(e.target.value)} style={inputStyle}>
+            {DEEP_INTERVALS.map((k) => (
+              <option key={k} value={k}>
+                {k}
+              </option>
+            ))}
+            <option value="custom">Custom interval…</option>
+          </select>
+          {intervalKey === "custom" && (
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <input
+                type="number"
+                min="1"
+                value={customAmount}
+                onChange={(e) => setCustomAmount(e.target.value)}
+                placeholder="e.g. 7"
+                style={{ ...inputStyle, flex: 1 }}
+              />
+              <select value={customUnit} onChange={(e) => setCustomUnit(e.target.value)} style={{ ...inputStyle, width: 120 }}>
+                <option value="m">minutes</option>
+                <option value="h">hours</option>
+                <option value="d">days</option>
+                <option value="w">weeks</option>
+              </select>
+            </div>
+          )}
+        </Field>
+
+        <Field label="How many candles to analyse">
+          <input
+            type="number"
+            min="2"
+            value={count}
+            onChange={(e) => setCount(e.target.value)}
+            placeholder="e.g. 100"
+            style={inputStyle}
+          />
+        </Field>
+
+        <button
+          onClick={run}
+          disabled={status === "loading"}
+          className="ft-btn"
+          style={{
+            width: "100%",
+            background: C.amber,
+            color: "#1A1300",
+            border: "none",
+            borderRadius: 8,
+            padding: "12px",
+            fontSize: 13.5,
+            fontWeight: 700,
+            opacity: status === "loading" ? 0.6 : 1,
+          }}
+        >
+          {status === "loading" ? "Analysing…" : "Run deep analysis"}
+        </button>
+        {error && <div style={{ fontSize: 12, color: C.loss, marginTop: 10 }}>{error}</div>}
+      </Card>
+
+      {result && (
+        <Card
+          title="Result"
+          right={
+            <span style={{ fontSize: 10.5, color: C.textDim, fontFamily: mono }}>
+              {result.actual} × {result.intervalLabel} candles
+            </span>
+          }
+        >
+          <div style={{ ...sectionStyle, display: "flex", alignItems: "center", gap: 10 }}>
+            <CoinIcon symbol={result.symbol} logos={logos} size={30} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 700, fontSize: 16, color: C.text }}>{result.symbol.replace("USDT", "/USDT")}</div>
+              <div style={{ fontSize: 11, color: C.textDim, fontFamily: mono }}>
+                Analysed {fmtDuration(result.durationMs)}
+              </div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.text }}>
+                {currentPrice !== null ? fmtPrice(currentPrice) : "—"}
+              </div>
+              <div style={{ fontSize: 10, color: C.textDim }}>Current price</div>
+            </div>
+          </div>
+
+          {result.actual < result.requested && (
+            <div style={{ fontSize: 11.5, color: C.amber, marginBottom: 12 }}>
+              Binance only has {result.actual} candles of history for this pair at {result.intervalLabel} — you asked for {result.requested}.
+            </div>
+          )}
+
+          <div style={sectionStyle}>
+            <div style={grid}>
+              <Item label="Duration of analysis" value={fmtDuration(result.durationMs)} sub={`${result.actual} × ${result.intervalLabel}`} />
+              <Item label="Change over duration" value={fmtPct(result.changePct)} color={pctColor(result.changePct)} />
+              <Item label="High" value={fmtPrice(result.high)} sub={fmtDate(result.highTime)} color={C.gain} />
+              <Item label="Low" value={fmtPrice(result.low)} sub={fmtDate(result.lowTime)} color={C.loss} />
+              <Item label="Volume over duration" value={fmtVol(result.quoteVolume) + " USDT"} color={C.teal} />
+              <Item
+                label="Open interest (now)"
+                value={result.oi != null ? fmtVol(result.oi) + " " + result.symbol.replace("USDT", "") : "—"}
+                sub={result.oi != null && currentPrice ? `≈ ${fmtVol(result.oi * currentPrice)} USDT` : null}
+                color={C.pink}
+              />
+            </div>
+          </div>
+
+          <div style={sectionStyle}>
+            <div style={grid}>
+              <Item
+                label="Funding fee"
+                value={f ? (f.rate >= 0 ? "+" : "") + (f.rate * 100).toFixed(4) + "%" : "—"}
+                color={f ? (f.rate >= 0 ? C.gain : C.loss) : C.textDim}
+                sub={`every ${result.fundingHours}h`}
+              />
+              <Item label="Next funding in" value={<FundingCountdown nextFundingTime={f?.nextFundingTime} />} />
+            </div>
+          </div>
+
+          <div style={sectionStyle}>
+            {ta ? (
+              <>
+                <div style={grid}>
+                  <Item label="Trend" value={<TaBadge text={ta.trend} tone={trendTone(ta.trend)} />} />
+                  <Item
+                    label="Strength"
+                    value={
+                      <>
+                        <TaBadge text={ta.trendStrength} tone={strengthTone(ta.trendStrength)} />
+                        {ta.adx !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>ADX {ta.adx.toFixed(0)}</span>}
+                      </>
+                    }
+                  />
+                  <Item
+                    label="Momentum"
+                    value={
+                      <>
+                        <TaBadge text={ta.momentum} tone={momentumTone(ta.momentum)} />
+                        {ta.rsi !== null && <span style={{ marginLeft: 6, fontSize: 11, color: C.textDim }}>RSI {ta.rsi.toFixed(0)}</span>}
+                      </>
+                    }
+                  />
+                  <Item label="Reversal" value={<TaBadge text={ta.reversal} tone={reversalTone(ta.reversal)} />} />
+                  <Item label="▲ Support" value={ta.support ? fmtPrice(ta.support) : "—"} color={C.gain} />
+                  <Item label="▼ Resistance" value={ta.resistance ? fmtPrice(ta.resistance) : "—"} color={C.loss} />
+                </div>
+                <div
+                  onClick={() => setShowHelp((v) => !v)}
+                  className="ft-btn"
+                  style={{ fontSize: 11, color: C.textMuted, marginTop: 12, display: "flex", alignItems: "center", gap: 4 }}
+                >
+                  <span>{showHelp ? "▾" : "▸"}</span> How these are worked out
+                </div>
+                {showHelp && (
+                  <>
+                    <TaConditionsNote />
+                    <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 6 }}>
+                      Here the same rules run on your chosen {result.intervalLabel} candles (plus {DEEP_WARMUP} earlier candles so the indicators are settled).
+                    </div>
+                  </>
+                )}
+              </>
+            ) : (
+              <div style={{ fontSize: 12, color: C.textDim }}>Not enough candles for trend / strength / momentum on this pair.</div>
+            )}
+          </div>
+
+          <div style={sectionStyle}>
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 10 }}>
+              All-time range
+            </div>
+            {athState.status === "loading" || athState.status === "idle" ? (
+              <div style={{ fontSize: 12, color: C.textMuted, fontFamily: mono }}>Loading full history…</div>
+            ) : athState.data ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div style={{ background: C.lossBg, borderRadius: 8, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time Low</div>
+                  <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.loss }}>{fmtPrice(athState.data.atl)}</div>
+                  <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athState.data.atlTime)}</div>
+                </div>
+                <div style={{ background: C.gainBg, borderRadius: 8, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 10.5, color: C.textMuted, marginBottom: 2 }}>All Time High</div>
+                  <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 15, color: C.gain }}>{fmtPrice(athState.data.ath)}</div>
+                  <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{fmtDate(athState.data.athTime)}</div>
+                </div>
+              </div>
+            ) : (
+              <div style={{ fontSize: 12, color: C.loss }}>Couldn't load all-time high/low right now.</div>
+            )}
+          </div>
+
+          <div>
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 10 }}>
+              Long / Short &amp; Positioning
+            </div>
+            {pos && pos.globalRatio !== null ? (
+              <>
+                <div style={grid}>
+                  <Item
+                    label="Long / Short ratio (all accounts)"
+                    value={pos.globalRatio.toFixed(2)}
+                    sub={`${pos.globalLongPct.toFixed(1)}% long · ${pos.globalShortPct.toFixed(1)}% short`}
+                    color={pos.globalRatio >= 1 ? C.gain : C.loss}
+                  />
+                  <Item
+                    label="Top traders (by position)"
+                    value={pos.topRatio !== null ? pos.topRatio.toFixed(2) : "—"}
+                    sub={pos.topLongPct !== null ? `${pos.topLongPct.toFixed(1)}% long · ${pos.topShortPct.toFixed(1)}% short` : null}
+                    color={pos.topRatio !== null ? (pos.topRatio >= 1 ? C.gain : C.loss) : C.textDim}
+                  />
+                  <Item label="Avg ratio over duration" value={pos.avgRatio !== null ? pos.avgRatio.toFixed(2) : "—"} />
+                  <Item
+                    label="Open interest change"
+                    value={pos.oiChangePct !== null ? fmtPct(pos.oiChangePct) : "—"}
+                    color={pctColor(pos.oiChangePct)}
+                  />
+                </div>
+                {read && (
+                  <div
+                    style={{
+                      marginTop: 12,
+                      fontSize: 12.5,
+                      color: toneColor(read.tone),
+                      background: C.panelAlt,
+                      border: `1px solid ${C.border}`,
+                      borderRadius: 8,
+                      padding: "10px 12px",
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    <span style={{ fontWeight: 700 }}>Positioning: </span>
+                    {read.text}
+                  </div>
+                )}
+                {pos.globalRatio > 1.5 && <div style={{ fontSize: 11.5, color: C.amber, marginTop: 8 }}>Longs look crowded — more room for a long squeeze.</div>}
+                {pos.globalRatio < 0.67 && <div style={{ fontSize: 11.5, color: C.amber, marginTop: 8 }}>Shorts look crowded — more room for a short squeeze.</div>}
+                <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 10 }}>
+                  Binance data in {pos.period} steps
+                  {pos.covered < pos.requested ? ` — only ${pos.covered} of ${pos.requested} periods available (Binance keeps about 30 days)` : ""}. Positioning compares the price change with the open-interest change over the same duration.
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 12, color: C.textDim }}>Long/short and positioning data isn't available for this pair right now.</div>
+            )}
+          </div>
+        </Card>
+      )}
+    </>
+  );
+}
 
 
 // Color-coded badge chip used throughout the screener table (trend,
@@ -3833,7 +4498,7 @@ function ScreenerPanel({
   const [query, setQuery] = useState("");
   const [trendFilter, setTrendFilter] = useState("all"); // all | Up | Down | Sideways
   const [levelFilter, setLevelFilter] = useState("none"); // none | support | resistance | reversal
-  const [sortKey, setSortKey] = useState("volume"); // volume | rsi | adx
+  const [sortKey, setSortKey] = useState("volume-desc"); // volume|rsi|adx + -desc|-asc
   const scanned = serverMode ? taServerCount : Object.keys(taMap).length;
 
   // ATH/ATL show automatically here, sourced from the same 1d bulk scan the
@@ -3894,13 +4559,23 @@ function ScreenerPanel({
       });
     }
     list = [...list];
-    if (sortKey === "rsi") {
-      list.sort((a, b) => (effectiveTaMap[b.symbol]?.rsi ?? -1) - (effectiveTaMap[a.symbol]?.rsi ?? -1));
-    } else if (sortKey === "adx") {
-      list.sort((a, b) => (effectiveTaMap[b.symbol]?.adx ?? -1) - (effectiveTaMap[a.symbol]?.adx ?? -1));
-    } else {
-      list.sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume));
-    }
+    const [field, dirKey] = sortKey.split("-");
+    const dir = dirKey === "asc" ? 1 : -1;
+    const valueOf = (r) => {
+      if (field === "rsi") return effectiveTaMap[r.symbol]?.rsi ?? null;
+      if (field === "adx") return effectiveTaMap[r.symbol]?.adx ?? null;
+      const v = parseFloat(r.quoteVolume);
+      return isFinite(v) ? v : null;
+    };
+    // Pairs with no reading yet always sink to the bottom, either direction.
+    list.sort((a, b) => {
+      const av = valueOf(a);
+      const bv = valueOf(b);
+      if (av === null && bv === null) return 0;
+      if (av === null) return 1;
+      if (bv === null) return -1;
+      return (av - bv) * dir;
+    });
     return list;
   }, [rows, effectiveTaMap, query, trendFilter, levelFilter, sortKey]);
 
@@ -4035,9 +4710,12 @@ function ScreenerPanel({
             outline: "none",
           }}
         >
-          <option value="volume">Sort: Volume</option>
-          <option value="rsi">Sort: RSI</option>
-          <option value="adx">Sort: Trend strength</option>
+          <option value="volume-desc">Volume: High → Low</option>
+          <option value="volume-asc">Volume: Low → High</option>
+          <option value="rsi-desc">RSI: High → Low</option>
+          <option value="rsi-asc">RSI: Low → High</option>
+          <option value="adx-desc">Trend strength: High → Low</option>
+          <option value="adx-asc">Trend strength: Low → High</option>
         </select>
         <button
           className="ft-btn"
@@ -4102,6 +4780,7 @@ function ScreenerPanel({
             <tr style={{ textAlign: "left", color: C.textMuted, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.3 }}>
               <th style={{ padding: "6px 8px" }}>Pair</th>
               <th style={{ padding: "6px 8px" }}>Price</th>
+              <th style={{ padding: "6px 8px" }}>Volume</th>
               <th style={{ padding: "6px 8px" }}>Trend</th>
               <th style={{ padding: "6px 8px" }}>Strength</th>
               <th style={{ padding: "6px 8px" }}>Momentum</th>
@@ -4127,6 +4806,7 @@ function ScreenerPanel({
                   <td style={{ padding: "8px 8px", fontFamily: mono, color: C.text }}>
                     {isFinite(price) ? fmtPrice(price) : "—"}
                   </td>
+                  <td style={{ padding: "8px 8px", fontFamily: mono, color: C.teal }}>{fmtVol(r.quoteVolume)}</td>
                   {!t ? (
                     <td colSpan={6} style={{ padding: "8px 8px", color: C.textDim, fontFamily: mono, fontSize: 11.5 }}>
                       scanning…
