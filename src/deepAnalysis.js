@@ -150,13 +150,28 @@ function pivotRel(arr) {
 
 // ------------------------------------------------------------------ zones
 
-// Clusters swing points + rejection wicks into price zones and scores them.
+// Clusters swing points, rejection wicks and flipped (broken) levels into
+// price zones and scores them. One engine feeds the summary AND the
+// breakout / breakdown section.
 function buildZones(kind, ctx) {
-  const { o, h, l, c, v, n, pivots, tol, avgVol } = ctx;
+  const { o, h, l, c, v, n, pivots, tol, avgVol, atr, last } = ctx;
   const isSup = kind === "support";
   const pts = new Map();
   const pivotList = isSup ? pivots.lows : pivots.highs;
-  pivotList.forEach((p) => pts.set(p.i, { i: p.i, price: p.price, pivot: true, wick: false }));
+  pivotList.forEach((p) => pts.set(p.i, { i: p.i, price: p.price, pivot: true, wick: false, flip: false }));
+  // previous breakout / breakdown levels: a broken swing high that price now
+  // sits above becomes support (and a broken swing low below becomes resistance)
+  const flipList = isSup ? pivots.highs : pivots.lows;
+  flipList.forEach((p) => {
+    for (let j = p.i + 1; j < n; j++) {
+      const broke = isSup ? c[j] > p.price + atr * 0.1 : c[j] < p.price - atr * 0.1;
+      if (broke) {
+        const stillSide = isSup ? last > p.price : last < p.price;
+        if (stillSide) pts.set("f" + p.i, { i: j, price: p.price, pivot: false, wick: false, flip: true });
+        break;
+      }
+    }
+  });
   for (let j = 0; j < n; j++) {
     const range = h[j] - l[j];
     if (range <= 0) continue;
@@ -168,7 +183,7 @@ function buildZones(kind, ctx) {
     const price = isSup ? l[j] : h[j];
     const ex = pts.get(j);
     if (ex) ex.wick = true;
-    else pts.set(j, { i: j, price, pivot: false, wick: true });
+    else pts.set("w" + j, { i: j, price, pivot: false, wick: true, flip: false });
   }
   const sorted = [...pts.values()].sort((a, b) => a.price - b.price);
   const clusters = [];
@@ -182,37 +197,44 @@ function buildZones(kind, ctx) {
     }
   });
 
-  const zones = clusters.map((cl) => {
+  return clusters.map((cl) => {
     const low = cl.min;
     const high = cl.max;
     const touches = cl.pts.length;
     const wicks = cl.pts.filter((p) => p.wick).length;
+    const flips = cl.pts.filter((p) => p.flip).length;
     const lastIdx = Math.max(...cl.pts.map((p) => p.i));
     // volume traded while price was testing the zone, relative to normal
     const testVols = [];
+    let closesIn = 0;
     for (let j = 0; j < n; j++) {
       const edge = isSup ? l[j] : h[j];
       if (edge >= low - tol && edge <= high + tol) testVols.push(v[j]);
+      if (c[j] >= low - tol * 0.5 && c[j] <= high + tol * 0.5) closesIn++;
     }
     const volRatio = avgVol > 0 && testVols.length ? mean(testVols) / avgVol : 1;
     const volScore = clamp(volRatio * 50, 0, 100);
+    const consScore = clamp((closesIn / Math.max(1, n * 0.12)) * 100, 0, 100);
     const strength =
-      0.4 * Math.min(100, (touches / 4) * 100) +
-      0.25 * Math.min(100, (wicks / 3) * 100) +
-      0.2 * volScore +
-      0.15 * ((lastIdx / Math.max(1, n - 1)) * 100);
+      0.35 * Math.min(100, (touches / 4) * 100) +
+      0.2 * Math.min(100, (wicks / 3) * 100) +
+      0.15 * volScore +
+      0.1 * ((lastIdx / Math.max(1, n - 1)) * 100) +
+      0.1 * consScore +
+      0.1 * (flips > 0 ? 100 : 0);
     return {
       low,
       high,
       mid: (low + high) / 2,
       touches,
       wicks,
+      flips,
+      closesIn,
       volRatio,
       lastIdx,
       strength: Math.round(clamp(strength, 0, 100)),
     };
   });
-  return zones;
 }
 
 function pickSide(zones, price, above, count = 3) {
@@ -222,42 +244,61 @@ function pickSide(zones, price, above, count = 3) {
   return top.sort((a, b) => (above ? a.mid - b.mid : b.mid - a.mid));
 }
 
+const strengthWord = (s) => (s < 20 ? "VERY WEAK" : s < 40 ? "WEAK" : s < 60 ? "MODERATE" : s < 80 ? "STRONG" : "VERY STRONG");
+
 // ------------------------------------------------------------------ main
 
-export function analyzeCandles(candles) {
-  const n = candles.length;
+// allCandles = warm-up candles + the candles the user chose (newest last).
+// winLen     = how many of the NEWEST candles are the analysis window.
+// Indicators (EMA / RSI / MACD / ADX) are computed on all candles so they are
+// settled, but every score, swing, zone and breakout reads the window only.
+// ext = optional derivatives data: { oiChangePct, oiRecentPct, longPct, fundingRate }
+export function analyzeCandles(allCandles, winLen, ext = {}) {
+  const N = allCandles.length;
+  const n = Math.min(winLen || N, N);
   if (n < MIN_ANALYSIS_CANDLES) return null;
-  const o = candles.map((k) => parseFloat(k[1]));
-  const h = candles.map((k) => parseFloat(k[2]));
-  const l = candles.map((k) => parseFloat(k[3]));
-  const c = candles.map((k) => parseFloat(k[4]));
-  const v = candles.map((k) => parseFloat(k[7]));
-  const last = c[n - 1];
-  const avgVol = mean(v);
+  const s0 = N - n;
+  const warmup = s0;
+  const pf = (k, i) => parseFloat(k[i]);
+  const oA = allCandles.map((k) => pf(k, 1));
+  const hA = allCandles.map((k) => pf(k, 2));
+  const lA = allCandles.map((k) => pf(k, 3));
+  const cA = allCandles.map((k) => pf(k, 4));
 
-  // periods scale with window length so a short window isn't judged by a
-  // 50-candle EMA it can't fill
-  const emaSlowP = clamp(Math.round(n / 2), 3, 50);
+  // periods follow the TOTAL history available (standard 20/50, 14, 12/26/9
+  // once warm-up exists; scaled down when there is little history)
+  const emaSlowP = clamp(Math.round(N / 2), 3, 50);
   const emaFastP = Math.max(2, Math.round(emaSlowP * 0.4));
-  const rsiP = clamp(n - 1, 2, 14);
-  const adxP = clamp(Math.floor(n / 2) - 1, 2, 14);
-  const macdSlowP = clamp(Math.round(n / 3), 5, 26);
+  const rsiP = clamp(N - 1, 2, 14);
+  const adxP = clamp(Math.floor(N / 2) - 1, 2, 14);
+  const macdSlowP = clamp(Math.round(N / 3), 5, 26);
   const macdFastP = Math.max(2, Math.round((macdSlowP * 12) / 26));
   const macdSigP = Math.max(2, Math.round((macdSlowP * 9) / 26));
   const swingK = n >= 300 ? 5 : n >= 120 ? 3 : 2;
   const params = { emaFastP, emaSlowP, rsiP, adxP, macdFastP, macdSlowP, macdSigP, swingK };
 
-  const emaF = emaSeries(c, emaFastP);
-  const emaS = emaSeries(c, emaSlowP);
-  const rsi = rsiSeries(c, rsiP);
-  const adx = adxSeries(h, l, c, adxP);
-  const macdFastS = emaSeries(c, macdFastP);
-  const macdSlowS = emaSeries(c, macdSlowP);
-  const macdLine = macdFastS.map((x, i) => x - macdSlowS[i]);
-  const macdSignal = emaSeries(macdLine, macdSigP);
-  const macdHist = macdLine.map((x, i) => x - macdSignal[i]);
+  const emaFA = emaSeries(cA, emaFastP);
+  const emaSA = emaSeries(cA, emaSlowP);
+  const rsiA = rsiSeries(cA, rsiP);
+  const adxA = adxSeries(hA, lA, cA, adxP);
+  const mFast = emaSeries(cA, macdFastP);
+  const mSlow = emaSeries(cA, macdSlowP);
+  const macdLineA = mFast.map((x, i) => x - mSlow[i]);
+  const macdSigA = emaSeries(macdLineA, macdSigP);
+  const macdHistA = macdLineA.map((x, i) => x - macdSigA[i]);
 
-  // ATR over the last rsiP candles, and the average candle range as a % of price
+  // ---- everything below is the analysis window only ----
+  const win = allCandles.slice(s0);
+  const o = oA.slice(s0), h = hA.slice(s0), l = lA.slice(s0), c = cA.slice(s0);
+  const v = win.map((k) => pf(k, 7));
+  const tbRaw = win.map((k) => (k[10] === undefined ? NaN : pf(k, 10)));
+  const hasTaker = tbRaw.every((x) => Number.isFinite(x)) && v.some((x) => x > 0);
+  const emaF = emaFA.slice(s0), emaS = emaSA.slice(s0);
+  const rsi = rsiA.slice(s0), adx = adxA.slice(s0);
+  const macdLine = macdLineA.slice(s0), macdHist = macdHistA.slice(s0);
+  const last = c[n - 1];
+  const avgVol = mean(v);
+
   const trs = [];
   for (let i = 1; i < n; i++) trs.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1])));
   const atr = mean(trs.slice(-Math.max(3, rsiP))) || last * 0.005;
@@ -267,72 +308,103 @@ export function analyzeCandles(candles) {
   const counts = labelSwings(pivots.highs, pivots.lows);
   const hRel = pivotRel(pivots.highs);
   const lRel = pivotRel(pivots.lows);
+  const rangeHi = Math.max(...h);
+  const rangeLo = Math.min(...l);
+  const pricePct = rangeHi > rangeLo ? (last - rangeLo) / (rangeHi - rangeLo) : 0.5;
+  const m = Math.max(3, Math.round(n / 5));
+  const third = Math.max(5, Math.round(n / 3));
+  const adxNow = adx[n - 1];
+  const rsiNow = rsi[n - 1];
 
   // ============================ 1. TREND =================================
   const emaDir = last > emaF[n - 1] && emaF[n - 1] > emaS[n - 1] ? 1 : last < emaF[n - 1] && emaF[n - 1] < emaS[n - 1] ? -1 : 0;
+  const emaTilt = emaDir !== 0 ? emaDir : 0.5 * sign(emaF[n - 1] - emaS[n - 1]);
   const reg = linReg(c);
-  const totalSlopePct = (reg.slope * (n - 1)) / mean(c) * 100;
-  const slopeDir = reg.r2 >= 0.35 && Math.abs(totalSlopePct) >= avgRangePct ? sign(reg.slope) : 0;
+  const slopePct = ((reg.slope * (n - 1)) / mean(c)) * 100;
+  const swingTotal = counts.HH + counts.LH + counts.HL + counts.LL;
+  const structScore = swingTotal ? (counts.HH + counts.HL - counts.LH - counts.LL) / swingTotal : 0;
+  const slopeScore = Math.abs(slopePct) >= avgRangePct * 1.5 ? sign(reg.slope) * clamp(reg.r2 / 0.6, 0, 1) : 0;
+  const lr = linReg(c.slice(-third));
+  const recentPct = ((lr.slope * (third - 1)) / mean(c.slice(-third))) * 100;
+  const recentDir = Math.abs(recentPct) >= avgRangePct * 0.8 && lr.r2 >= 0.25 ? sign(lr.slope) : 0;
+  const recentScore = recentDir !== 0 ? recentDir * clamp(lr.r2 / 0.5, 0, 1) : 0;
+  const trendComposite = 0.3 * structScore + 0.3 * slopeScore + 0.2 * emaTilt + 0.2 * recentScore;
+  let trendDir = trendComposite > 0.2 ? 1 : trendComposite < -0.2 ? -1 : 0;
+  // a big, clean directional move is a trend even if the swings look mixed
+  const bigMove = reg.r2 >= 0.6 && Math.abs(slopePct) >= avgRangePct * 3;
+  if (bigMove && sign(reg.slope) * structScore > -0.5) trendDir = sign(reg.slope);
+  const trendLabel = trendDir === 1 ? "BULLISH" : trendDir === -1 ? "BEARISH" : "SIDEWAYS";
+
   const structure = hRel === 1 && lRel === 1 ? "BULLISH" : hRel === -1 && lRel === -1 ? "BEARISH" : "MIXED";
   const structDir = structure === "BULLISH" ? 1 : structure === "BEARISH" ? -1 : 0;
-  const votes = emaDir + slopeDir + structDir;
-  const trendDir = votes >= 2 ? 1 : votes <= -2 ? -1 : 0;
-  const trendLabel = trendDir === 1 ? "UP" : trendDir === -1 ? "DOWN" : "SIDEWAYS";
 
-  // continuing or weakening?
-  const m = Math.max(3, Math.round(n / 5));
-  const third = Math.max(5, Math.round(n / 3));
   const weakSignals = [];
   if (trendDir !== 0) {
-    const adxNow = adx[n - 1];
     const adxBefore = adx[n - 1 - m];
     if (adxNow !== null && adxBefore !== null && adxBefore - adxNow >= 3) weakSignals.push("ADX is falling");
-    const recent = linReg(c.slice(-third)).slope;
-    if (trendDir * recent < trendDir * reg.slope * 0.4) weakSignals.push("recent price slope has flattened or turned");
-    const hNow = macdHist[n - 1];
+    if (trendDir * lr.slope < trendDir * reg.slope * 0.4) weakSignals.push("recent price slope has flattened or turned");
     const hPeak = trendDir === 1 ? Math.max(...macdHist.slice(-third)) : Math.min(...macdHist.slice(-third));
-    if (trendDir * hNow < trendDir * hPeak * 0.6 && trendDir * hPeak > 0) weakSignals.push("MACD histogram is shrinking");
-    if (trendDir * (last - emaF[n - 1]) < 0) weakSignals.push(`price has lost the EMA${emaFastP}`);
+    if (trendDir * macdHist[n - 1] < trendDir * hPeak * 0.6 && trendDir * hPeak > 0) weakSignals.push("MACD histogram is shrinking");
+    if (trendDir * (last - emaF[n - 1]) < 0) weakSignals.push(`price is below/above the EMA${emaFastP} against the trend`);
   }
-  const trendState =
-    trendDir === 0
-      ? "Ranging — no established trend to continue"
-      : weakSignals.length >= 2
-      ? "Weakening"
-      : weakSignals.length === 1
-      ? "Continuing, with early fatigue"
-      : "Continuing";
+  let condition;
+  if (trendDir === 0) {
+    condition = recentDir === 0 ? "Sideways / range" : recentDir === 1 ? "Range with an upside push" : "Range with a downside push";
+  } else if (recentDir === trendDir) {
+    condition = weakSignals.length >= 2 ? "Trend continuing, but weakening" : weakSignals.length === 1 ? "Trend continuing, early fatigue" : "Trend continuing";
+  } else if (recentDir === 0) {
+    condition = trendDir * (last - emaF[n - 1]) < 0 ? "Pullback / Consolidation" : "Consolidation";
+  } else {
+    condition = "Pullback";
+  }
 
   // ======================== 2. TREND STRENGTH ============================
-  const adxNow = adx[n - 1];
+  const dirFor = trendDir !== 0 ? trendDir : sign(reg.slope);
   const comps = [];
-  if (adxNow !== null) comps.push({ name: "ADX", weight: 0.4, score: clamp(adxNow * 2, 0, 100), text: `ADX ${adxNow.toFixed(0)}` });
-  const emaAligned = emaDir !== 0;
+  if (swingTotal > 0) {
+    const bullFrac = (counts.HH + counts.HL) / swingTotal;
+    const dom = dirFor === -1 ? 1 - bullFrac : dirFor === 1 ? bullFrac : Math.max(bullFrac, 1 - bullFrac);
+    comps.push({ name: "Market structure", weight: 0.3, score: dom * 100, text: `${counts.HH} HH · ${counts.HL} HL · ${counts.LH} LH · ${counts.LL} LL` });
+  }
+  const slopeAgree = dirFor === 0 || sign(reg.slope) === dirFor ? 1 : 0.4;
+  comps.push({
+    name: "Price slope",
+    weight: 0.2,
+    score: clamp(reg.r2 * 100 * slopeAgree * clamp(Math.abs(slopePct) / (avgRangePct * 2), 0.25, 1), 0, 100),
+    text: `${slopePct >= 0 ? "+" : ""}${slopePct.toFixed(1)}% over the period, R² ${reg.r2.toFixed(2)}`,
+  });
   comps.push({
     name: "EMA alignment",
     weight: 0.2,
-    score: emaAligned ? clamp(40 + (Math.abs(emaF[n - 1] - emaS[n - 1]) / atr) * 30, 0, 100) : 15,
-    text: emaAligned ? `price, EMA${emaFastP}, EMA${emaSlowP} aligned ${emaDir === 1 ? "up" : "down"}` : "EMAs not aligned",
+    score: emaDir === 0 ? 30 : emaDir === dirFor ? clamp(40 + (Math.abs(emaF[n - 1] - emaS[n - 1]) / atr) * 30, 0, 100) : 10,
+    text: emaDir === 0 ? "EMAs mixed" : `price, EMA${emaFastP}, EMA${emaSlowP} aligned ${emaDir === 1 ? "up" : "down"}`,
   });
-  comps.push({ name: "Price slope", weight: 0.2, score: clamp(reg.r2 * 100, 0, 100), text: `${totalSlopePct >= 0 ? "+" : ""}${totalSlopePct.toFixed(1)}% over the period, R² ${reg.r2.toFixed(2)}` });
-  const swingTotal = counts.HH + counts.LH + counts.HL + counts.LL;
-  if (swingTotal > 0) {
-    const bullFrac = (counts.HH + counts.HL) / swingTotal;
-    const dominant = trendDir === -1 ? 1 - bullFrac : trendDir === 1 ? bullFrac : Math.max(bullFrac, 1 - bullFrac);
-    comps.push({ name: "Market structure", weight: 0.2, score: dominant * 100, text: `${counts.HH} HH · ${counts.HL} HL · ${counts.LH} LH · ${counts.LL} LL` });
+  if (adxNow !== null) comps.push({ name: "ADX", weight: 0.2, score: clamp(adxNow * 2, 0, 100), text: `ADX ${adxNow.toFixed(0)}` });
+  {
+    const segs = Math.max(2, Math.min(6, Math.floor(n / 4)));
+    let agreeSeg = 0;
+    for (let g = 0; g < segs; g++) {
+      const a = Math.floor((g * n) / segs);
+      const b = Math.floor(((g + 1) * n) / segs) - 1;
+      if (b > a && sign(c[b] - c[a]) === dirFor && dirFor !== 0) agreeSeg++;
+    }
+    const sideShare = c.filter((x, i) => (dirFor === 1 ? x > emaS[i] : dirFor === -1 ? x < emaS[i] : false)).length / n;
+    comps.push({
+      name: "Consistency",
+      weight: 0.1,
+      score: dirFor === 0 ? 0 : (0.5 * (agreeSeg / segs) + 0.5 * sideShare) * 100,
+      text: dirFor === 0 ? "no direction" : `${agreeSeg} of ${segs} segments and ${(sideShare * 100).toFixed(0)}% of closes agree`,
+    });
   }
   const wSum = comps.reduce((s, x) => s + x.weight, 0);
   const strengthScore = Math.round(comps.reduce((s, x) => s + x.score * x.weight, 0) / wSum);
-  const strengthLabel =
-    strengthScore < 20 ? "Very Weak" : strengthScore < 40 ? "Weak" : strengthScore < 60 ? "Moderate" : strengthScore < 80 ? "Strong" : "Very Strong";
+  const strengthLabel = strengthWord(strengthScore);
 
   // =========================== 3. MOMENTUM ===============================
-  const rsiNow = rsi[n - 1];
   const rr = clamp(Math.round(n / 5), 3, 14);
   const roc = ((last - c[n - 1 - rr]) / c[n - 1 - rr]) * 100;
-  const L = third;
   let upV = 0, dnV = 0, bodySigned = 0, bodyAbs = 0;
-  for (let i = n - L; i < n; i++) {
+  for (let i = n - third; i < n; i++) {
     if (c[i] >= o[i]) upV += v[i];
     else dnV += v[i];
     bodySigned += c[i] - o[i];
@@ -340,29 +412,42 @@ export function analyzeCandles(candles) {
   }
   const volFlow = upV + dnV > 0 ? (upV - dnV) / (upV + dnV) : 0;
   const candleFlow = bodyAbs > 0 ? bodySigned / bodyAbs : 0;
-  const macdScore = clamp(0.7 * (macdHist[n - 1] / (0.1 * atr)) + 0.3 * (macdLine[n - 1] / (0.5 * atr)), -1, 1);
+  const macdVal = clamp(0.7 * (macdHist[n - 1] / (0.1 * atr)) + 0.3 * (macdLine[n - 1] / (0.5 * atr)), -1, 1);
+  const cls = (x) => (x > 0.15 ? "BULLISH" : x < -0.15 ? "BEARISH" : "NEUTRAL");
   const mComps = [
     { name: "RSI", weight: 0.25, value: rsiNow === null ? 0 : clamp((rsiNow - 50) / 30, -1, 1), text: rsiNow === null ? "n/a" : `RSI${rsiP} ${rsiNow.toFixed(0)}` },
-    { name: "MACD", weight: 0.25, value: macdScore, text: `histogram ${macdHist[n - 1] >= 0 ? "positive" : "negative"}, line ${macdLine[n - 1] >= 0 ? "above" : "below"} zero` },
+    { name: "MACD histogram", weight: 0.25, value: macdVal, text: `histogram ${macdHist[n - 1] >= 0 ? "positive" : "negative"}, line ${macdLine[n - 1] >= 0 ? "above" : "below"} zero` },
     { name: "Rate of change", weight: 0.2, value: clamp(roc / (avgRangePct * Math.sqrt(rr) * 0.8), -1, 1), text: `${roc >= 0 ? "+" : ""}${roc.toFixed(2)}% over ${rr} candles` },
-    { name: "Volume flow", weight: 0.15, value: volFlow, text: `${volFlow >= 0 ? "more volume on up" : "more volume on down"} candles (last ${L})` },
-    { name: "Candle movement", weight: 0.15, value: candleFlow, text: `${candleFlow >= 0 ? "bullish" : "bearish"} bodies dominate (last ${L})` },
-  ];
+    { name: "Volume flow", weight: 0.15, value: volFlow, text: `${volFlow >= 0 ? "more volume on up" : "more volume on down"} candles (last ${third})` },
+    { name: "Candle bodies", weight: 0.15, value: candleFlow, text: `${candleFlow >= 0 ? "bullish" : "bearish"} bodies dominate (last ${third})` },
+  ].map((x) => ({ ...x, cls: cls(x.value) }));
   const agg = mComps.reduce((s, x) => s + x.value * x.weight, 0);
-  const mDirRaw = agg > 0.15 ? 1 : agg < -0.15 ? -1 : 0;
-  const agreeCount = mComps.filter((x) => mDirRaw !== 0 && sign(x.value, 0.1) === mDirRaw).length;
-  const mDir = mDirRaw !== 0 && agreeCount >= 3 ? mDirRaw : 0; // need 3 of 5 to agree
-  const momentumLabel = mDir === 1 ? "BULLISH" : mDir === -1 ? "BEARISH" : "NEUTRAL";
-  const momentumScore = Math.round(clamp(Math.abs(agg) * 140, 0, 100));
+  const bullN = mComps.filter((x) => x.cls === "BULLISH").length;
+  const bearN = mComps.filter((x) => x.cls === "BEARISH").length;
+  const mDir = agg > 0.15 && bullN >= 3 && bearN <= 1 ? 1 : agg < -0.15 && bearN >= 3 && bullN <= 1 ? -1 : 0;
+  let momentumScore = Math.round(clamp(Math.abs(agg) * 140, 0, 100));
+  if (mDir === 0) momentumScore = Math.min(momentumScore, 39);
+  const kShift = Math.max(2, Math.round(n / 10));
+  const histDelta = macdHist[n - 1] - macdHist[n - 1 - kShift];
+  const rsiPrev = rsi[n - 1 - kShift];
+  const rsiDelta = rsiNow !== null && rsiPrev !== null ? rsiNow - rsiPrev : 0;
+  const shift = mDir * (sign(histDelta, 0.02 * atr) + sign(rsiDelta, 2));
+  const mTrend = mDir === 0 ? "" : shift <= -1 ? "Weakening " : shift >= 1 ? "Strengthening " : "";
+  const dirWord = mDir === 1 ? "Bullish" : mDir === -1 ? "Bearish" : "";
+  const momentumDisplay = mDir === 0 ? "Mixed / Weak" : mTrend + dirWord;
+  const mAgree = mDir === 1 ? bullN : mDir === -1 ? bearN : Math.max(bullN, bearN);
+  const momentumCondition =
+    mDir === 0
+      ? "Indicators disagree — no clear momentum edge"
+      : mAgree >= 4
+      ? `${dirWord} momentum is established across most measures${mTrend ? ` but ${mTrend.trim().toLowerCase()}` : ""}`
+      : `${dirWord} momentum is developing but not confirmed${mTrend ? ` (${mTrend.trim().toLowerCase()})` : ""}`;
 
-  // ====================== 4. REVERSAL DETECTION ==========================
-  const rangeHi = Math.max(...h);
-  const rangeLo = Math.min(...l);
-  const pricePct = rangeHi > rangeLo ? (last - rangeLo) / (rangeHi - rangeLo) : 0.5;
+  // ====================== 4. EARLY REVERSAL ==============================
   const lastTwo = (arr) => (arr.length >= 2 ? [arr[arr.length - 2], arr[arr.length - 1]] : null);
   const hi2 = lastTwo(pivots.highs);
   const lo2 = lastTwo(pivots.lows);
-  const warm = macdSlowP; // MACD / RSI values before this are still settling
+  const warm = Math.max(0, macdSlowP - warmup); // values this early in the window are still settling only when little warm-up exists
   const divergence = (series, bear) => {
     const pair = bear ? hi2 : lo2;
     if (!pair) return false;
@@ -374,8 +459,9 @@ export function analyzeCandles(candles) {
     const scale = series === macdLine ? atr * 0.1 : 2;
     return bear ? priceMove > EQ && sb < sa - scale : priceMove < -EQ && sb > sa + scale;
   };
-  const rsiMax = Math.max(...rsi.slice(-third).filter((x) => x !== null));
-  const rsiMin = Math.min(...rsi.slice(-third).filter((x) => x !== null));
+  const rsiVals = rsi.slice(-third).filter((x) => x !== null);
+  const rsiMax = rsiVals.length ? Math.max(...rsiVals) : 50;
+  const rsiMin = rsiVals.length ? Math.min(...rsiVals) : 50;
   const histDecl3 = (bear) => {
     const a = macdHist[n - 1], b = macdHist[n - 2], d = macdHist[n - 3];
     return bear ? a > 0 && a < b && b < d : a < 0 && a > b && b > d;
@@ -400,11 +486,11 @@ export function analyzeCandles(candles) {
     return false;
   };
   const volumeSignal = (bear) => {
-    const vol20 = mean(v.slice(-Math.min(30, n)));
+    const volRef = mean(v.slice(-Math.min(30, n)));
     let climax = false;
     for (let j = n - 5; j < n; j++) {
       const range = h[j] - l[j];
-      if (range <= 0 || v[j] < vol20 * 1.8) continue;
+      if (range <= 0 || v[j] < volRef * 1.8) continue;
       if (bear && h[j] - Math.max(o[j], c[j]) >= range * 0.5 && c[j] <= h[j] - range * 0.5) climax = true;
       if (!bear && Math.min(o[j], c[j]) - l[j] >= range * 0.5 && c[j] >= l[j] + range * 0.5) climax = true;
     }
@@ -421,11 +507,11 @@ export function analyzeCandles(candles) {
     { key: "macdDiv", name: "MACD divergence", weight: 15, test: (b) => divergence(macdLine, b) },
     {
       key: "momWeak",
-      name: "Weakening momentum",
+      name: "Momentum weakening",
       weight: 15,
       test: (b) => (b ? (rsiMax >= 65 && rsiNow !== null && rsiNow <= rsiMax - 8) || histDecl3(true) : (rsiMin <= 35 && rsiNow !== null && rsiNow >= rsiMin + 8) || histDecl3(false)),
     },
-    { key: "emaBreak", name: `Break of EMA${emaFastP}`, weight: 15, test: emaBreak },
+    { key: "emaBreak", name: `EMA${emaFastP} break`, weight: 15, test: emaBreak },
     { key: "failBreak", name: "Failed breakout / breakdown", weight: 10, test: failedBreakout },
     { key: "volume", name: "Volume exhaustion / climax", weight: 10, test: volumeSignal },
     { key: "structure", name: "Market-structure change", weight: 20, test: structureBreak },
@@ -437,133 +523,374 @@ export function analyzeCandles(candles) {
   };
   const bearRev = evalSide(true);
   const bullRev = evalSide(false);
-  const lead = bearRev.score === bullRev.score ? null : bearRev.score > bullRev.score ? "BEARISH" : "BULLISH";
-  const leadSide = lead === "BEARISH" ? bearRev : lead === "BULLISH" ? bullRev : { facs: bearRev.facs.map((f) => ({ ...f, hit: false })), score: 0, hits: 0 };
-  const structureHit = leadSide.facs.find((f) => f.key === "structure")?.hit;
-  const revStatus = leadSide.hits >= 5 && structureHit ? "Confirmed" : leadSide.hits >= 3 ? "Probable" : leadSide.hits >= 1 ? "Possible" : "None";
-  // never above the "high" band without confirmation
-  const revRisk = revStatus === "Confirmed" ? leadSide.score : Math.min(leadSide.score, 74);
-  const revLabel = revRisk < 25 ? "LOW" : revRisk < 50 ? "MEDIUM" : revRisk < 75 ? "HIGH" : "VERY HIGH";
+  const revLead = bearRev.score === bullRev.score ? null : bearRev.score > bullRev.score ? "BEARISH" : "BULLISH";
+  const leadSide = revLead === "BEARISH" ? bearRev : revLead === "BULLISH" ? bullRev : { facs: bearRev.facs.map((f) => ({ ...f, hit: false })), score: 0, hits: 0 };
+  const revScore = leadSide.score;
+  const structureHit = !!leadSide.facs.find((f) => f.key === "structure")?.hit;
+  const revBand = revScore <= 20 ? "No reversal" : revScore <= 40 ? "Early warning" : revScore <= 60 ? "Possible" : revScore <= 80 ? "Probable" : "Strong reversal";
+  const revConfirmed = structureHit && revScore >= 61;
+  const revText =
+    revBand === "No reversal"
+      ? "No reversal"
+      : revBand === "Early warning"
+      ? "Early warning — not confirmed"
+      : revConfirmed
+      ? revBand
+      : `${revBand} — not confirmed (market structure has not changed)`;
+  const revShort = revBand === "No reversal" ? "None" : `${revLead === "BEARISH" ? "Bearish" : "Bullish"} ${revBand === "Early warning" ? "Warning" : revBand === "Strong reversal" ? "Reversal" : revBand}`;
 
   // ===================== 5/6. SUPPORT & RESISTANCE =======================
   const tol = Math.max(atr * 0.35, last * 0.0015);
-  const zctx = { o, h, l, c, v, n, pivots, tol, avgVol };
+  const zctx = { o, h, l, c, v, n, pivots, tol, avgVol, atr, last };
   const supAll = buildZones("support", zctx);
   const resAll = buildZones("resistance", zctx);
   const support = pickSide(supAll, last, false);
   const resistance = pickSide(resAll, last, true);
+  const zoneLabel = (z) => {
+    if (!z) return null;
+    const si = support.indexOf(z);
+    if (si >= 0) return "S" + (si + 1);
+    const ri = resistance.indexOf(z);
+    return ri >= 0 ? "R" + (ri + 1) : null;
+  };
 
-  // ====================== 7. BREAKOUT / BREAKDOWN ========================
-  const volAvgPrior = (j) => mean(v.slice(Math.max(0, j - 20), j)) || avgVol;
-  const sideStatus = (isRes) => {
+  // ======================= 7/8. BREAKOUT & BREAKDOWN =====================
+  const volPrior = (j) => mean(v.slice(Math.max(0, j - 20), j)) || avgVol;
+  const L = Math.max(3, Math.min(8, Math.round(n / 8)));
+  const evalBreak = (isRes) => {
     const zones = isRes ? resAll : supAll;
     let best = null;
-    const consider = (rank, zone, status, note) => {
-      if (!best || rank < best.rank || (rank === best.rank && zone.strength > best.zone.strength)) best = { rank, zone, status, note };
+    const consider = (rank, zone, status, note, extra = {}) => {
+      if (!best || rank < best.rank || (rank === best.rank && zone.strength > best.zone.strength))
+        best = { rank, zone, status, note, volume: "n/a", retest: "n/a", ...extra };
     };
+    const word = isRes ? "resistance" : "support";
     zones.forEach((z) => {
+      if (Math.abs(z.mid - last) > atr * 5) return;
       const edge = isRes ? z.high : z.low;
-      for (let j = Math.max(1, n - 3); j < n; j++) {
-        const beyond = isRes ? c[j] > edge + atr * 0.1 : c[j] < edge - atr * 0.1;
-        const prevInside = isRes ? c[j - 1] <= edge : c[j - 1] >= edge;
-        const stillBeyond = isRes ? last > edge : last < edge;
-        if (beyond && prevInside && stillBeyond) {
-          const volOk = v[j] >= volAvgPrior(j) * 1.2;
-          consider(volOk ? 0 : 1, z, volOk ? (isRes ? "Breakout confirmed" : "Breakdown confirmed") : (isRes ? "Breakout probable" : "Breakdown probable"),
-            volOk ? "closed beyond the zone on above-average volume" : "closed beyond the zone, but volume did not confirm");
+      const beyond = (x, k = 0.1) => (isRes ? x > edge + atr * k : x < edge - atr * k);
+      const inside = (x) => (isRes ? x <= edge : x >= edge);
+      // first candle in the recent window that closed beyond the zone after being inside
+      let b = -1;
+      for (let j = Math.max(1, n - L); j < n; j++) {
+        if (beyond(c[j]) && inside(c[j - 1])) {
+          b = j;
+          break;
         }
-        const wickOnly = isRes ? h[j] > edge && c[j] <= edge && last <= edge : l[j] < edge && c[j] >= edge && last >= edge;
-        if (wickOnly) consider(2, z, isRes ? "Rejected at resistance" : "Rejected at support", "wick-only move through the zone — not a confirmed break");
+      }
+      if (b >= 0) {
+        let failed = false;
+        for (let j = b + 1; j < n; j++) if (inside(c[j])) failed = true;
+        const meaningful = beyond(c[b], 0.25);
+        const volOk = v[b] >= volPrior(b) * 1.2 || (b + 1 < n && v[b + 1] >= volPrior(b + 1) * 1.2);
+        const held = n - 1 - b >= 1 && !failed;
+        let retest = "Not retested yet";
+        for (let j = b + 1; j < n; j++) {
+          const touched = isRes ? l[j] <= edge + atr * 0.25 : h[j] >= edge - atr * 0.25;
+          if (touched) {
+            retest = isRes ? (c[j] > edge ? "Held" : "Failed") : c[j] < edge ? "Held" : "Failed";
+            break;
+          }
+        }
+        const checks = [
+          { name: `Close ${isRes ? "above" : "below"} the zone`, ok: true },
+          { name: "Meaningful distance beyond it (≥ 0.25 ATR)", ok: meaningful },
+          { name: `${isRes ? "Buying" : "Selling"} volume above normal`, ok: volOk },
+          { name: `Price ${isRes ? "holds above" : "stays below"} the zone`, ok: held },
+          { name: "Retest", ok: retest === "Held" ? true : retest === "Failed" ? false : null },
+        ];
+        if (failed) {
+          consider(2, z, isRes ? "Failed breakout" : "Failed breakdown", "price closed beyond the zone, then closed back inside it", { volume: volOk ? "Confirmed" : "Not confirmed", retest, checks, brk: true, failed: true });
+        } else if (meaningful && volOk && held && retest !== "Failed") {
+          consider(0, z, `${isRes ? "Breakout" : "Breakdown"} confirmed${retest === "Held" ? " (retest held)" : ""}`, "closed beyond the zone with distance and volume, and has held", { volume: "Confirmed", retest, checks, brk: true, confirmed: true });
+        } else {
+          const missing = [!meaningful && "distance is small", !volOk && "volume did not confirm", !held && "no follow-through candle yet", retest === "Failed" && "retest failed"].filter(Boolean);
+          consider(1, z, `${isRes ? "Breakout" : "Breakdown"} probable — not confirmed`, `closed beyond the zone, but ${missing.join(", ")}`, { volume: volOk ? "Confirmed" : "Not confirmed", retest, checks, brk: true, probable: true });
+        }
+        return;
+      }
+      const wickOnly = (() => {
+        for (let j = Math.max(0, n - L); j < n; j++) {
+          const poked = isRes ? h[j] > edge && c[j] <= edge : l[j] < edge && c[j] >= edge;
+          if (poked && inside(last)) return true;
+        }
+        return false;
+      })();
+      if (wickOnly) {
+        consider(2, z, `Rejected at ${word} (wick only)`, "a wick went through the zone but no candle closed beyond it — not a breakout", { volume: "n/a", wick: true });
+        return;
       }
       const dist = isRes ? z.low - last : last - z.high;
-      const inside = last >= z.low - atr * 0.25 && last <= z.high + atr * 0.25;
-      if (inside) consider(3, z, isRes ? "Testing resistance" : "Testing support", "price is inside / touching the zone");
-      else if (dist > 0 && dist <= atr * 1.5) consider(4, z, isRes ? "Approaching resistance" : "Approaching support", `${((dist / last) * 100).toFixed(2)}% away`);
+      const touching = last >= z.low - atr * 0.25 && last <= z.high + atr * 0.25;
+      if (touching) consider(3, z, `Testing ${word}`, "price is inside / touching the zone");
+      else if (dist > 0 && dist <= atr * 1.5) consider(4, z, `Approaching ${word}`, `${((dist / last) * 100).toFixed(2)}% away`);
     });
-    return best ? { status: best.status, zone: best.zone, note: best.note } : { status: "None nearby", zone: null, note: "no zone within 1.5 ATR" };
+    return best || { rank: 9, zone: null, status: "None nearby", note: `no ${word} zone within reach`, volume: "n/a", retest: "n/a" };
   };
-  const resBreak = sideStatus(true);
-  const supBreak = sideStatus(false);
+  const resBreak = evalBreak(true);
+  const supBreak = evalBreak(false);
 
-  // breakout risk: how primed is price to make a decisive move
-  const nearestZoneDist = Math.min(
-    ...[...resAll.filter((z) => z.mid >= last).map((z) => z.low - last), ...supAll.filter((z) => z.mid <= last).map((z) => last - z.high), Infinity].map((d) => Math.max(0, d))
+  // ===================== WHALE-STYLE POSITIONING =========================
+  const buyRatio = (a, b) => {
+    let tb = 0, tv = 0;
+    for (let j = a; j <= b; j++) {
+      tb += tbRaw[j];
+      tv += v[j];
+    }
+    return tv > 0 ? tb / tv : null;
+  };
+  const tNow = hasTaker ? buyRatio(n - third, n - 1) : null;
+  const tPrev = hasTaker && n - third >= 6 ? buyRatio(0, n - third - 1) : null;
+  const tAll = hasTaker ? buyRatio(0, n - 1) : null;
+  const chgPct = ((last - c[0]) / c[0]) * 100;
+  const rangePct = ((rangeHi - rangeLo) / mean(c)) * 100;
+  const pxState = Math.abs(chgPct) < 0.3 * rangePct ? 0 : sign(chgPct);
+  const oiChg = Number.isFinite(ext.oiChangePct) ? ext.oiChangePct : null;
+  const oiKnown = oiChg !== null;
+  const volRise = mean(v.slice(-third)) / (avgVol || 1);
+  const longPct = Number.isFinite(ext.longPct) ? ext.longPct : null;
+  const fundPct = Number.isFinite(ext.fundingRate) ? ext.fundingRate * 100 : null;
+  const s1 = support[0] || null;
+  const r1 = resistance[0] || null;
+  let absDown = 0, absUp = 0;
+  for (let j = Math.max(0, n - Math.max(10, Math.round(n / 2))); j < n; j++) {
+    const range = h[j] - l[j];
+    if (range <= 0 || v[j] < avgVol * 1.3) continue;
+    if (Math.min(o[j], c[j]) - l[j] >= range * 0.4 && c[j] >= l[j] + range * 0.5) absDown++;
+    if (h[j] - Math.max(o[j], c[j]) >= range * 0.4 && c[j] <= h[j] - range * 0.5) absUp++;
+  }
+  const flowF = [];
+  const addF = (name, weight, a, d, ok, text) => flowF.push({ name, weight, accum: a, dist: d, available: ok, text });
+  addF(
+    "Price vs open interest",
+    20,
+    oiKnown ? (pxState >= 0 && oiChg > 1.5 ? (pxState === 0 ? 1 : 0.7) : pxState >= 0 && Math.abs(oiChg) <= 1.5 ? 0.3 : pxState === -1 && oiChg > 1.5 ? 0.1 : 0) : 0,
+    oiKnown ? (pxState <= 0 && pricePct >= 0.55 && oiChg > 1.5 ? 1 : pxState === -1 && oiChg > 1.5 ? 0.6 : pxState === 0 && oiChg > 1.5 ? 0.4 : 0) : 0,
+    oiKnown,
+    oiKnown ? `price ${chgPct >= 0 ? "+" : ""}${chgPct.toFixed(2)}% (${pxState === 0 ? "range-bound" : pxState > 0 ? "rising" : "falling"}), open interest ${oiChg >= 0 ? "+" : ""}${oiChg.toFixed(1)}%` : "open interest history unavailable for this window"
   );
-  let brScore = 0;
-  if (nearestZoneDist <= atr * 0.5) brScore += 40;
-  else if (nearestZoneDist <= atr * 1.5) brScore += 25;
-  else if (nearestZoneDist <= atr * 3) brScore += 10;
-  const recentRange = mean(h.slice(-5).map((x, i) => x - l.slice(-5)[i]));
-  const allRange = mean(h.map((x, i) => x - l[i]));
-  if (allRange > 0 && recentRange < allRange * 0.7) brScore += 20; // squeeze
-  if (mean(v.slice(-3)) > avgVol * 1.2) brScore += 15;
-  const adxPrev = adx[n - 1 - m];
-  if (adxNow !== null && adxPrev !== null && adxNow > adxPrev + 2) brScore += 10;
-  if (/Testing|Rejected|probable|confirmed/i.test(resBreak.status + " " + supBreak.status)) brScore += 15;
-  brScore = clamp(brScore, 0, 100);
-  const breakoutRisk = brScore < 35 ? "LOW" : brScore < 65 ? "MEDIUM" : "HIGH";
+  const vr = clamp((volRise - 0.9) / 0.6, 0, 1);
+  addF("Volume", 10, vr * (pxState >= 0 ? 1 : 0.3), vr * (pxState <= 0 || pricePct >= 0.6 ? 1 : 0.4), true, `recent volume ${volRise.toFixed(2)}× the period average`);
+  if (hasTaker) {
+    const ab = clamp((tNow - 0.5) / 0.06, -1, 1);
+    const rb = tPrev !== null ? clamp((tNow - tPrev) / 0.04, -1, 1) : 0;
+    addF("Taker buy / sell", 20, clamp(0.6 * Math.max(0, ab) + 0.4 * Math.max(0, rb), 0, 1), clamp(0.6 * Math.max(0, -ab) + 0.4 * Math.max(0, -rb), 0, 1), true, `aggressive buyers took ${(tNow * 100).toFixed(1)}% of recent volume${tPrev !== null ? ` (earlier ${(tPrev * 100).toFixed(1)}%)` : ""}`);
+  } else addF("Taker buy / sell", 20, 0, 0, false, "taker data not available");
+  addF("Long / short ratio", 5, longPct === null ? 0 : longPct < 45 ? 1 : longPct < 50 ? 0.5 : 0, longPct === null ? 0 : longPct > 62 ? 1 : longPct > 56 ? 0.5 : 0, longPct !== null, longPct === null ? "not available" : `${longPct.toFixed(0)}% of accounts are long`);
+  addF("Funding rate", 5, fundPct === null ? 0 : fundPct < 0 ? clamp(-fundPct / 0.03, 0, 1) : 0, fundPct === null ? 0 : fundPct > 0 ? clamp(fundPct / 0.05, 0, 1) : 0, fundPct !== null, fundPct === null ? "not available" : `${fundPct >= 0 ? "+" : ""}${fundPct.toFixed(4)}% (${fundPct > 0 ? "longs pay shorts" : fundPct < 0 ? "shorts pay longs" : "flat"})`);
+  {
+    const heldSup = s1 ? !c.slice(-third).some((x) => x < s1.low - atr * 0.1) : false;
+    const nearSup = s1 ? (last - s1.high) / atr <= 3 : false;
+    const aS = s1 && heldSup ? clamp(0.4 + (s1.strength / 100) * 0.6, 0, 1) * (nearSup ? 1 : 0.5) : 0;
+    let rej = 0;
+    if (r1) for (let j = n - third; j < n; j++) if (h[j] >= r1.low - atr * 0.15 && c[j] <= r1.high) rej++;
+    const nearRes = r1 ? (r1.low - last) / atr <= 3 : false;
+    const dR = r1 ? clamp(rej / 3, 0, 1) * 0.7 + (nearRes ? 0.3 : 0) : pricePct >= 0.9 ? 0.3 : 0;
+    addF("Support defended / resistance rejecting", 20, aS, dR, true, `${s1 ? (heldSup ? `support S1 is holding (strength ${s1.strength})` : "support S1 has been closed below") : "no support zone under price"}; ${r1 ? `${rej} recent rejection${rej === 1 ? "" : "s"} near R1` : "no resistance above"}`);
+  }
+  addF("Repeated absorption", 20, clamp(absDown / 3, 0, 1), clamp(absUp / 3, 0, 1), true, `${absDown} high-volume candles that absorbed selling, ${absUp} that absorbed buying`);
+  const avail = flowF.filter((f) => f.available);
+  const wAvail = avail.reduce((s, f) => s + f.weight, 0) || 1;
+  let accum = (avail.reduce((s, f) => s + f.accum * f.weight, 0) / wAvail) * 100;
+  const distr = (avail.reduce((s, f) => s + f.dist * f.weight, 0) / wAvail) * 100;
+  const shortCovering = oiKnown && pxState === 1 && oiChg < -1.5;
+  const longLiq = oiKnown && pxState === -1 && oiChg < -1.5;
+  if (shortCovering) accum *= 0.6;
+  if (longLiq) accum *= 0.7;
+  accum = Math.round(clamp(accum, 0, 100));
+  const distScore = Math.round(clamp(distr, 0, 100));
+  const flowState = shortCovering
+    ? "Short covering"
+    : longLiq
+    ? "Long liquidation"
+    : accum >= 45 && accum >= distScore + 10
+    ? "Possible accumulation"
+    : distScore >= 45 && distScore >= accum + 10
+    ? "Possible distribution"
+    : "No clear accumulation or distribution";
+  const flowNote =
+    flowState === "Short covering"
+      ? "Price is rising while open interest falls — shorts are closing rather than new buyers arriving."
+      : flowState === "Long liquidation"
+      ? "Price is falling while open interest falls — longs are being closed out rather than new shorts opening."
+      : flowState === "Possible accumulation"
+      ? "Price is holding, support is being defended and buying pressure / open interest are building."
+      : flowState === "Possible distribution"
+      ? "Price is stalling or rejecting near resistance while selling pressure / open interest build."
+      : "The evidence points both ways or is too thin to call.";
 
-  // ========================== 8. FINAL ANALYSIS ==========================
-  const brBias = /Breakout confirmed/.test(resBreak.status) ? 1 : /Breakdown confirmed/.test(supBreak.status) ? -1 : /Breakout probable/.test(resBreak.status) ? 0.5 : /Breakdown probable/.test(supBreak.status) ? -0.5 : 0;
+  // ---- probabilities ----
+  const nearestDist = (isUp) => {
+    const z = isUp ? resistance[0] : support[0];
+    if (!z) return null;
+    return (isUp ? z.low - last : last - z.high) / atr;
+  };
+  const squeeze = (() => {
+    const rec = mean(h.slice(-5).map((x, i) => x - l.slice(-5)[i]));
+    const all = mean(h.map((x, i) => x - l[i]));
+    return all > 0 && rec < all * 0.7;
+  })();
+  const volUp = mean(v.slice(-3)) > avgVol * 1.2;
+  const sideProb = (isUp) => {
+    const st = isUp ? resBreak : supBreak;
+    const sd = isUp ? 1 : -1;
+    if (st.confirmed) return 85;
+    if (st.probable) return 62;
+    let p = 0;
+    const d = nearestDist(isUp);
+    if (d !== null) p += d <= 0.5 ? 30 : d <= 1.5 ? 22 : d <= 3 ? 10 : 2;
+    p += trendDir === sd ? 15 : trendDir === 0 ? 5 : 0;
+    p += mDir === sd ? 15 : mDir === 0 ? 5 : 0;
+    p += volUp ? 10 : 0;
+    p += squeeze ? 8 : 0;
+    p += structDir === sd ? 8 : 0;
+    p += (isUp ? accum - distScore : distScore - accum) >= 15 ? 8 : 0;
+    if (st.wick || st.failed) p -= 15;
+    return Math.round(clamp(Math.min(p, 70), 0, 100));
+  };
+  const breakoutProb = sideProb(true);
+  const breakdownProb = sideProb(false);
+  const facHit = (side, key) => !!side.facs.find((f) => f.key === key)?.hit;
+  const falseBreakoutRisk = Math.round(
+    clamp(
+      (resBreak.wick || resBreak.failed ? 30 : 0) +
+        (resBreak.volume === "Not confirmed" ? 15 : 0) +
+        (mean(v.slice(-3)) < avgVol ? 10 : 0) +
+        (rsiNow !== null && rsiNow > 70 ? 10 : 0) +
+        (facHit(bearRev, "rsiDiv") ? 15 : 0) +
+        (facHit(bearRev, "macdDiv") ? 10 : 0) +
+        (mDir !== 1 ? 10 : 0) +
+        (facHit(bearRev, "failBreak") ? 10 : 0) +
+        (distScore >= 60 ? 10 : 0) +
+        (longPct !== null && longPct > 62 ? 5 : 0) +
+        (fundPct !== null && fundPct > 0.05 ? 5 : 0),
+      0,
+      100
+    )
+  );
+  const bearTrapRisk = Math.round(
+    clamp(
+      (supBreak.wick || supBreak.failed ? 30 : 0) +
+        (supBreak.volume === "Not confirmed" ? 15 : 0) +
+        (mean(v.slice(-3)) < avgVol ? 10 : 0) +
+        (rsiNow !== null && rsiNow < 30 ? 10 : 0) +
+        (facHit(bullRev, "rsiDiv") ? 15 : 0) +
+        (facHit(bullRev, "macdDiv") ? 10 : 0) +
+        (mDir !== -1 ? 10 : 0) +
+        (facHit(bullRev, "failBreak") ? 10 : 0) +
+        (accum >= 60 ? 10 : 0) +
+        (longPct !== null && longPct < 45 ? 5 : 0) +
+        (fundPct !== null && fundPct < -0.03 ? 5 : 0),
+      0,
+      100
+    )
+  );
+  const shape = (st, prob, risk, riskName) => ({
+    status: st.status,
+    probability: prob,
+    volume: st.volume,
+    retest: st.retest,
+    risk,
+    riskName,
+    note: st.note,
+    zone: st.zone,
+    zoneLabel: zoneLabel(st.zone),
+    checks: st.checks || null,
+  });
+  const breakout = shape(resBreak, breakoutProb, falseBreakoutRisk, "False breakout risk");
+  const breakdown = shape(supBreak, breakdownProb, bearTrapRisk, "Bear trap risk");
+
+  // ========================== FINAL ANALYSIS =============================
   const composite =
-    0.3 * trendDir * (strengthScore / 100) +
-    0.25 * mDir * (momentumScore / 100) +
-    0.2 * structDir +
-    0.15 * ((bullRev.score - bearRev.score) / 100) +
-    0.1 * brBias;
+    0.28 * trendDir * (strengthScore / 100) +
+    0.22 * mDir * (momentumScore / 100) +
+    0.18 * structDir +
+    0.12 * ((bullRev.score - bearRev.score) / 100) +
+    0.1 * ((breakoutProb - breakdownProb) / 100) +
+    0.1 * ((accum - distScore) / 100);
   const overallScore = Math.round(clamp(50 + 50 * composite, 0, 100));
   const overallLabel = overallScore >= 65 ? "BULLISH BIAS" : overallScore <= 35 ? "BEARISH BIAS" : "NEUTRAL / MIXED";
-
   const biasSign = overallScore >= 65 ? 1 : overallScore <= 35 ? -1 : 0;
+  const slopeDirSimple = Math.abs(slopePct) >= avgRangePct * 1.5 && reg.r2 >= 0.35 ? sign(reg.slope) : 0;
   const groups = [
     { name: "EMA alignment", dir: emaDir },
-    { name: "price slope", dir: slopeDir },
+    { name: "price slope", dir: slopeDirSimple },
     { name: "market structure", dir: structDir },
     { name: "MACD", dir: sign(macdHist[n - 1] + macdLine[n - 1]) },
     { name: "RSI", dir: rsiNow === null ? 0 : rsiNow > 55 ? 1 : rsiNow < 45 ? -1 : 0 },
     { name: "volume flow", dir: sign(volFlow, 0.1) },
   ];
   const agreeing = biasSign === 0 ? [] : groups.filter((g) => g.dir === biasSign);
-  const confirmation =
-    biasSign === 0 ? "No directional bias" : agreeing.length >= 5 ? "Confirmed" : agreeing.length === 4 ? "Probable" : "Possible";
+  const confirmation = biasSign === 0 ? "No directional bias" : agreeing.length >= 5 ? "Confirmed" : agreeing.length === 4 ? "Probable" : "Possible";
 
-  const pctAway = (z) => (z ? Math.abs(((z.mid - last) / last) * 100).toFixed(2) + "%" : null);
-  const parts = [];
-  parts.push(
-    `Trend is ${trendLabel} (${trendDir === 0 ? "the EMA, slope and structure votes don't agree" : `${Math.abs(votes)} of 3 votes agree: ${[emaDir && "EMA alignment", slopeDir && "price slope", structDir && "market structure"].filter(Boolean).join(", ")}`}) and ${trendState.toLowerCase()}, with strength ${strengthScore}/100 (${strengthLabel}${adxNow !== null ? `, ADX ${adxNow.toFixed(0)}` : ""}).`
+  // market state + what to watch
+  const nearR = r1 && (r1.low - last) / atr <= 1.5;
+  const nearS = s1 && (last - s1.high) / atr <= 1.5;
+  const where = nearR ? "near resistance" : nearS ? "near support" : "mid-range";
+  const trendWord = trendDir === 1 ? "Bullish" : trendDir === -1 ? "Bearish" : "Sideways";
+  const marketState = `${trendWord} trend → ${trendDir === 0 ? "ranging" : "currently " + condition.toLowerCase().replace("trend ", "")} ${where}`;
+  const fp = (z) => (z ? fmtP(z.mid) : null);
+  const watch = [];
+  if (trendDir === 1) {
+    watch.push(r1 ? `A candle close above R1 (${fp(r1)}) with above-average volume would strengthen the bullish continuation scenario.` : "Price is at the top of this period with no resistance zone above — watch for a pullback and whether it holds support.");
+    watch.push(s1 ? `A rejection followed by a break below the nearest support (${fp(s1)}) would increase reversal probability.` : "A drop back through recent swing lows would increase reversal probability.");
+  } else if (trendDir === -1) {
+    watch.push(s1 ? `A candle close below S1 (${fp(s1)}) with above-average volume would strengthen the bearish continuation scenario.` : "Price is at the bottom of this period with no support zone below — watch for a bounce and whether it fails at resistance.");
+    watch.push(r1 ? `A rejection followed by a close above the nearest resistance (${fp(r1)}) on volume would increase reversal probability.` : "A rise back through recent swing highs would increase reversal probability.");
+  } else {
+    watch.push(r1 ? `A close above R1 (${fp(r1)}) on above-average volume would be the first sign of an upside breakout.` : "No resistance zone above — watch for a push to new highs on volume.");
+    watch.push(s1 ? `A close below S1 (${fp(s1)}) on above-average volume would be the first sign of a downside breakdown.` : "No support zone below — watch for a push to new lows on volume.");
+  }
+
+  const explanation = [];
+  explanation.push(
+    `Overall trend is ${trendLabel} (structure ${structScore > 0.15 ? "bullish" : structScore < -0.15 ? "bearish" : "mixed"}, slope ${slopePct >= 0 ? "+" : ""}${slopePct.toFixed(1)}% with R² ${reg.r2.toFixed(2)}, EMAs ${emaDir === 0 ? "mixed" : emaDir === 1 ? "aligned up" : "aligned down"}); right now it is "${condition.toLowerCase()}". Strength ${strengthScore}/100 (${strengthLabel.toLowerCase()}).`
   );
-  parts.push(
-    `Momentum is ${momentumLabel} at ${momentumScore}/100 — ${mDir === 0 ? "fewer than 3 of 5 momentum measures agree" : `${agreeCount} of 5 measures agree`}${rsiNow !== null ? `, RSI ${rsiNow.toFixed(0)}` : ""}.`
+  explanation.push(`Momentum is ${momentumDisplay.toLowerCase()} at ${momentumScore}/100 — ${momentumCondition.toLowerCase()}.`);
+  explanation.push(
+    revBand === "No reversal"
+      ? `No meaningful reversal factors are lining up (${revScore}/100).`
+      : `Reversal: ${revText.toLowerCase()} — ${revLead ? revLead.toLowerCase() : ""} side scores ${revScore}/100 with ${leadSide.hits} of 7 factors.`
   );
-  parts.push(
-    revStatus === "None"
-      ? "No reversal factors are lining up (risk " + revRisk + "/100, " + revLabel + ")."
-      : `Reversal risk ${revRisk}/100 (${revLabel}): a ${revStatus.toLowerCase()} ${lead ? lead.toLowerCase() : ""} reversal with ${leadSide.hits} of 7 factors${revStatus === "Confirmed" ? "" : " — not confirmed"}.`
-  );
-  const zoneBits = [];
-  if (resistance[0]) zoneBits.push(`R1 ${pctAway(resistance[0])} above`);
-  if (support[0]) zoneBits.push(`S1 ${pctAway(support[0])} below`);
-  parts.push(`Market structure is ${structure}${zoneBits.length ? `; nearest zones: ${zoneBits.join(", ")}` : ""}. Resistance: ${resBreak.status.toLowerCase()}; support: ${supBreak.status.toLowerCase()}. Breakout risk ${breakoutRisk}.`);
-  parts.push(
-    `Overall ${overallScore}/100 (50 is neutral, higher is more bullish): trend ${trendDir === 0 ? "adds nothing" : `${trendDir === 1 ? "adds" : "subtracts"} weight`}, momentum ${mDir === 0 ? "adds nothing" : mDir === 1 ? "adds" : "subtracts"}, structure ${structDir === 0 ? "is mixed" : structDir === 1 ? "is bullish" : "is bearish"}. ${
-      biasSign === 0 ? "No directional bias is strong enough to call." : `${confirmation} ${biasSign === 1 ? "bullish" : "bearish"} lean — ${agreeing.length} of ${groups.length} independent factors agree (${agreeing.map((g) => g.name).join(", ")}).`
-    } This is a read of the candles you chose, not a buy or sell signal.`
+  explanation.push(`Positioning reads as "${flowState.toLowerCase()}" (accumulation ${accum}/100, distribution ${distScore}/100) — inferred from price, volume and derivatives data, not proof of what large traders are doing.`);
+  explanation.push(
+    `Overall market score ${overallScore}/100 (50 is neutral): ${biasSign === 0 ? "no directional bias is strong enough to call" : `${confirmation.toLowerCase()} ${biasSign === 1 ? "bullish" : "bearish"} lean, ${agreeing.length} of ${groups.length} independent groups agree`}. This is a read of the candles you chose, not a buy or sell signal.`
   );
 
   return {
     n,
+    warmup,
     last,
     params,
     atr,
-    trend: { label: trendLabel, dir: trendDir, votes: { ema: emaDir, slope: slopeDir, structure: structDir }, state: trendState, weakSignals, counts, slopePct: totalSlopePct, r2: reg.r2 },
+    trend: { label: trendLabel, dir: trendDir, condition, recentDir, weakSignals, counts, slopePct, r2: reg.r2, recentPct },
     strength: { score: strengthScore, label: strengthLabel, components: comps.map((x) => ({ name: x.name, score: Math.round(x.score), weight: x.weight, text: x.text })) },
-    momentum: { label: momentumLabel, score: momentumScore, dir: mDir, agree: agreeCount, components: mComps.map((x) => ({ name: x.name, value: x.value, text: x.text })) },
-    reversal: { lead, status: revStatus, risk: Math.round(revRisk), label: revLabel, hits: leadSide.hits, factors: leadSide.facs, bearScore: bearRev.score, bullScore: bullRev.score },
+    momentum: {
+      display: momentumDisplay,
+      dir: mDir,
+      dirLabel: mDir === 1 ? "BULLISH" : mDir === -1 ? "BEARISH" : "MIXED / WEAK",
+      score: momentumScore,
+      strengthLabel: strengthWord(momentumScore),
+      condition: momentumCondition,
+      agree: mAgree,
+      components: mComps.map((x) => ({ name: x.name, cls: x.cls, value: x.value, text: x.text })),
+    },
+    reversal: { lead: revLead, score: revScore, band: revBand, text: revText, short: revShort, confirmed: revConfirmed, structureHit, hits: leadSide.hits, factors: leadSide.facs, bearScore: bearRev.score, bullScore: bullRev.score },
+    flow: { accum, dist: distScore, state: flowState, note: flowNote, factors: flowF, usedOi: oiKnown, usedTaker: hasTaker },
     support,
     resistance,
-    breakout: { resistance: resBreak, support: supBreak, risk: breakoutRisk, score: Math.round(brScore) },
+    breakout,
+    breakdown,
     structure,
     overall: { score: overallScore, label: overallLabel, confirmation, agreeing: agreeing.map((g) => g.name), total: groups.length },
-    explanation: parts,
+    marketState,
+    watch,
+    explanation,
   };
+}
+
+function fmtP(x) {
+  if (!Number.isFinite(x)) return "—";
+  const a = Math.abs(x);
+  return a >= 1000 ? x.toFixed(1) : a >= 1 ? x.toFixed(3) : a >= 0.01 ? x.toFixed(5) : x.toPrecision(4);
 }

@@ -3770,6 +3770,7 @@ const NATIVE_KLINE_MS = {
 };
 const CUSTOM_UNIT_MS = { m: 60000, h: 3600000, d: 86400000, w: 604800000 };
 const MAX_BASE_CANDLES = 6000;
+const DEEP_WARMUP = 200; // warm-up candles fetched before the chosen window
 
 // Decide which Binance interval to download, and how many of those candles
 // make up one analysis candle.
@@ -3827,6 +3828,9 @@ function aggregateCandles(candles, ratio) {
       s.reduce((a, k) => a + parseFloat(k[5]), 0),
       s[s.length - 1][6],
       s.reduce((a, k) => a + parseFloat(k[7]), 0),
+      s.reduce((a, k) => a + (parseFloat(k[8]) || 0), 0),
+      s.reduce((a, k) => a + (parseFloat(k[9]) || 0), 0),
+      s.reduce((a, k) => a + (parseFloat(k[10]) || 0), 0),
     ]);
   }
   return out;
@@ -3990,15 +3994,18 @@ function AnalysisReport({ an, result, showHelp, setShowHelp }) {
   const small = { fontSize: 11, color: C.textDim, lineHeight: 1.5 };
   const dirColor = (d) => (d > 0 ? C.gain : d < 0 ? C.loss : C.amber);
   const scoreColor = (s) => (s >= 65 ? C.gain : s <= 35 ? C.loss : C.amber);
-  const riskColor = (l) => ({ LOW: C.gain, MEDIUM: C.amber, HIGH: C.loss, "VERY HIGH": C.loss }[l] || C.textMuted);
-  const Row = ({ k, v, color }) => (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, padding: "5px 0" }}>
-      <span style={{ fontSize: 12, color: C.textMuted }}>{k}</span>
-      <span style={{ fontFamily: mono, fontWeight: 700, fontSize: 13, color: color || C.text, textAlign: "right" }}>{v}</span>
+  const riskColor = (s) => (s >= 60 ? C.loss : s >= 35 ? C.amber : C.gain);
+  const Row = ({ k, v, color, sub }) => (
+    <div style={{ padding: "5px 0" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+        <span style={{ fontSize: 12, color: C.textMuted }}>{k}</span>
+        <span style={{ fontFamily: mono, fontWeight: 700, fontSize: 13, color: color || C.text, textAlign: "right" }}>{v}</span>
+      </div>
+      {sub && <div style={{ ...small, textAlign: "right", marginTop: 1 }}>{sub}</div>}
     </div>
   );
   const Bar = ({ pct, color }) => (
-    <div style={{ height: 5, background: C.border, borderRadius: 3, overflow: "hidden", width: 60 }}>
+    <div style={{ height: 5, background: C.border, borderRadius: 3, overflow: "hidden", width: 60, flexShrink: 0 }}>
       <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, pct))}%`, background: color }} />
     </div>
   );
@@ -4015,7 +4022,7 @@ function AnalysisReport({ an, result, showHelp, setShowHelp }) {
                 {z.high - z.low > 0 && <span style={{ fontSize: 10, color: C.textDim }}> ({fmtPrice(z.low)}–{fmtPrice(z.high)})</span>}
               </span>
               <Bar pct={z.strength} color={color} />
-              <span style={{ fontFamily: mono, fontSize: 12, color: C.textMuted, width: 40, textAlign: "right" }}>{z.strength}/100</span>
+              <span style={{ fontFamily: mono, fontSize: 12, color: C.textMuted, width: 44, textAlign: "right" }}>{z.strength}/100</span>
             </>
           ) : (
             <span style={{ fontSize: 12, color: C.textDim }}>none found in this period</span>
@@ -4023,6 +4030,17 @@ function AnalysisReport({ an, result, showHelp, setShowHelp }) {
         </div>
       );
     });
+  const Checks = ({ b }) =>
+    b.checks ? (
+      <div style={{ margin: "4px 0 6px" }}>
+        {b.checks.map((c) => (
+          <div key={c.name} style={{ display: "flex", gap: 8, fontSize: 11.5, padding: "2px 0", color: c.ok ? C.text : C.textDim }}>
+            <span style={{ width: 14, color: c.ok === true ? C.gain : c.ok === false ? C.loss : C.textDim }}>{c.ok === true ? "✓" : c.ok === false ? "✗" : "–"}</span>
+            <span style={{ flex: 1 }}>{c.name}</span>
+          </div>
+        ))}
+      </div>
+    ) : null;
 
   if (!an) {
     return (
@@ -4034,25 +4052,38 @@ function AnalysisReport({ an, result, showHelp, setShowHelp }) {
     );
   }
   const r = an.reversal;
-  const base = an.trend.counts;
+  const cnt = an.trend.counts;
   const sup = an.support, res = an.resistance;
+  const fl = an.flow;
+  const bo = an.breakout, bd = an.breakdown;
   return (
     <>
       <div style={sectionStyle}>
         <div style={head}>Final analysis</div>
-        <Row k="Trend" v={an.trend.label} color={dirColor(an.trend.dir)} />
-        <Row k="Trend Strength" v={`${an.strength.score}/100 · ${an.strength.label}`} color={scoreColor(an.strength.score >= 60 ? 70 : an.strength.score >= 40 ? 50 : 30)} />
-        <Row k="Momentum" v={an.momentum.label} color={dirColor(an.momentum.dir)} />
-        <Row k="Momentum Strength" v={`${an.momentum.score}/100`} />
-        <Row k="Reversal Risk" v={`${r.risk}/100 · ${r.label}`} color={riskColor(r.label)} />
+        <Row k="Overall Trend" v={an.trend.label} color={dirColor(an.trend.dir)} />
+        <Row k="Current Condition" v={an.trend.condition} />
+        <Row k="Trend Strength" v={`${an.strength.score}/100 · ${an.strength.label}`} />
+        <Row k="Momentum" v={an.momentum.display} color={dirColor(an.momentum.dir)} />
+        <Row k="Momentum Strength" v={`${an.momentum.strengthLabel} ${an.momentum.score}/100`} sub={an.momentum.condition} />
+        <Row k="Early Reversal" v={`${r.short} ${r.score}/100`} color={r.band === "No reversal" ? C.textMuted : C.amber} sub={r.text} />
+        <Row k="Accumulation Probability" v={`${fl.accum}/100`} color={fl.accum >= 60 ? C.gain : C.text} />
+        <Row k="Distribution Probability" v={`${fl.dist}/100`} color={fl.dist >= 60 ? C.loss : C.text} sub={fl.state} />
+        <Row k="Nearest Support" v={sup[0] ? fmtPrice(sup[0].mid) : "none in period"} color={C.gain} />
+        <Row k="Nearest Resistance" v={res[0] ? fmtPrice(res[0].mid) : "none in period"} color={C.loss} />
+        <Row k="Breakout Probability" v={`${bo.probability}/100`} sub={bo.status} />
+        <Row k="Breakdown Probability" v={`${bd.probability}/100`} sub={bd.status} />
+        <Row k="False Breakout Risk" v={`${bo.risk}/100`} color={riskColor(bo.risk)} />
+        <Row k="Bear Trap Risk" v={`${bd.risk}/100`} color={riskColor(bd.risk)} />
         <Row k="Market Structure" v={an.structure} color={an.structure === "BULLISH" ? C.gain : an.structure === "BEARISH" ? C.loss : C.amber} />
-        <Row k="Breakout Risk" v={an.breakout.risk} color={riskColor(an.breakout.risk)} />
         <div style={{ background: C.bg, borderRadius: 8, padding: "10px 12px", marginTop: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div>
             <div style={{ fontSize: 10.5, color: C.textDim }}>Overall Market Score</div>
             <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>50 = neutral · {an.overall.label.toLowerCase()}</div>
           </div>
-          <div style={{ fontFamily: mono, fontWeight: 800, fontSize: 24, color: scoreColor(an.overall.score) }}>{an.overall.score}<span style={{ fontSize: 12, color: C.textDim }}>/100</span></div>
+          <div style={{ fontFamily: mono, fontWeight: 800, fontSize: 24, color: scoreColor(an.overall.score) }}>
+            {an.overall.score}
+            <span style={{ fontSize: 12, color: C.textDim }}>/100</span>
+          </div>
         </div>
         <div style={{ marginTop: 12 }}>
           <div style={{ fontSize: 11, color: C.gain, fontWeight: 700, marginBottom: 2 }}>Support</div>
@@ -4061,25 +4092,34 @@ function AnalysisReport({ an, result, showHelp, setShowHelp }) {
           {zoneRows(res, "R", C.loss)}
         </div>
         <div style={{ marginTop: 12, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+          <div style={{ fontSize: 11, color: C.textDim, fontWeight: 700 }}>Market state</div>
+          <div style={{ fontSize: 12.5, color: C.text, margin: "3px 0 10px" }}>{an.marketState}</div>
+          <div style={{ fontSize: 11, color: C.textDim, fontWeight: 700 }}>What to watch next</div>
+          {an.watch.map((t, i) => (
+            <div key={i} style={{ ...small, color: C.textMuted, margin: "3px 0" }}>{t}</div>
+          ))}
+        </div>
+        <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+          <div style={{ fontSize: 11, color: C.textDim, fontWeight: 700, marginBottom: 3 }}>Why this score</div>
           {an.explanation.map((t, i) => (
-            <div key={i} style={{ ...small, marginBottom: 6, color: C.textMuted }}>{t}</div>
+            <div key={i} style={{ ...small, marginBottom: 5, color: C.textMuted }}>{t}</div>
           ))}
         </div>
       </div>
 
       <div style={sectionStyle}>
-        <div style={head}>1 · Trend</div>
-        <Row k="Direction" v={an.trend.label} color={dirColor(an.trend.dir)} />
-        <Row k="Status" v={an.trend.state} />
-        <Row k="Swings" v={`${base.HH} HH · ${base.HL} HL · ${base.LH} LH · ${base.LL} LL`} />
+        <div style={head}>Trend</div>
+        <Row k="Overall period trend" v={an.trend.label} color={dirColor(an.trend.dir)} />
+        <Row k="Current short-term" v={an.trend.condition} sub={`last third of the period: ${an.trend.recentPct >= 0 ? "+" : ""}${an.trend.recentPct.toFixed(2)}%`} />
+        <Row k="Swings" v={`${cnt.HH} HH · ${cnt.HL} HL · ${cnt.LH} LH · ${cnt.LL} LL`} />
         {an.trend.weakSignals.length > 0 && <div style={{ ...small, marginTop: 4 }}>Fatigue signs: {an.trend.weakSignals.join("; ")}.</div>}
       </div>
 
       <div style={sectionStyle}>
-        <div style={head}>2 · Trend strength — {an.strength.score}/100</div>
+        <div style={head}>Trend strength — {an.strength.score}/100</div>
         {an.strength.components.map((c) => (
           <div key={c.name} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0" }}>
-            <span style={{ fontSize: 12, color: C.textMuted, width: 108 }}>{c.name}</span>
+            <span style={{ fontSize: 12, color: C.textMuted, width: 104 }}>{c.name} <span style={{ color: C.textDim, fontSize: 10 }}>{Math.round(c.weight * 100)}%</span></span>
             <Bar pct={c.score} color={C.teal} />
             <span style={{ fontSize: 10.5, color: C.textDim, flex: 1 }}>{c.text}</span>
           </div>
@@ -4087,45 +4127,61 @@ function AnalysisReport({ an, result, showHelp, setShowHelp }) {
       </div>
 
       <div style={sectionStyle}>
-        <div style={head}>3 · Momentum — {an.momentum.label} {an.momentum.score}/100</div>
+        <div style={head}>Momentum — {an.momentum.dirLabel} · {an.momentum.strengthLabel} {an.momentum.score}/100</div>
         {an.momentum.components.map((c) => (
           <div key={c.name} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0" }}>
-            <span style={{ fontSize: 12, color: C.textMuted, width: 108 }}>{c.name}</span>
-            <span style={{ fontFamily: mono, fontSize: 11, fontWeight: 700, color: dirColor(c.value > 0.1 ? 1 : c.value < -0.1 ? -1 : 0), width: 20 }}>{c.value > 0.1 ? "▲" : c.value < -0.1 ? "▼" : "–"}</span>
+            <span style={{ fontSize: 12, color: C.textMuted, width: 104 }}>{c.name}</span>
+            <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, color: dirColor(c.cls === "BULLISH" ? 1 : c.cls === "BEARISH" ? -1 : 0), width: 58 }}>{c.cls}</span>
             <span style={{ fontSize: 10.5, color: C.textDim, flex: 1 }}>{c.text}</span>
           </div>
         ))}
-        <div style={{ ...small, marginTop: 4 }}>{an.momentum.agree} of 5 measures point the same way (3 needed to call Bullish/Bearish).</div>
+        <div style={{ ...small, marginTop: 4 }}>{an.momentum.condition}.</div>
       </div>
 
       <div style={sectionStyle}>
-        <div style={head}>4 · Reversal check</div>
-        <Row k="Status" v={r.status === "None" ? "No reversal signs" : `${r.status} ${r.lead ? r.lead.toLowerCase() : ""}`} color={r.status === "Confirmed" ? C.loss : r.status === "None" ? C.textMuted : C.amber} />
-        <Row k="Factors met" v={`${r.hits} of ${r.factors.length}`} />
+        <div style={head}>Early reversal — {r.score}/100</div>
+        <Row k="Reading" v={r.text} color={r.band === "No reversal" ? C.textMuted : C.amber} />
         {r.factors.map((f) => (
           <div key={f.key} style={{ display: "flex", gap: 8, fontSize: 11.5, padding: "2px 0", color: f.hit ? C.text : C.textDim }}>
             <span style={{ width: 14, color: f.hit ? C.amber : C.textDim }}>{f.hit ? "✓" : "·"}</span>
             <span style={{ flex: 1 }}>{f.name}</span>
-            <span style={{ fontFamily: mono }}>{f.weight}</span>
+            <span style={{ fontFamily: mono }}>{f.hit ? f.weight : 0}/{f.weight}</span>
           </div>
         ))}
         <div style={{ ...small, marginTop: 6 }}>
-          Confirmed needs 5+ factors including a market-structure break; 3–4 is Probable, 1–2 is Possible. Without confirmation risk is capped below Very High.
+          0–20 none · 21–40 early warning · 41–60 possible · 61–80 probable · 81+ strong. Never "confirmed" unless market structure has changed.
         </div>
       </div>
 
       <div style={sectionStyle}>
-        <div style={head}>7 · Breakout / breakdown</div>
-        {[["Resistance", an.breakout.resistance], ["Support", an.breakout.support]].map(([k, b]) => (
-          <div key={k} style={{ padding: "4px 0" }}>
-            <Row k={k} v={b.status} color={/confirmed/i.test(b.status) ? C.amber : C.text} />
-            <div style={{ ...small, textAlign: "right" }}>
-              {b.zone ? `zone ${fmtPrice(b.zone.mid)} · ` : ""}
-              {b.note}
-            </div>
+        <div style={head}>Positioning — {fl.state}</div>
+        <Row k="Accumulation probability" v={`${fl.accum}/100`} />
+        <Row k="Distribution probability" v={`${fl.dist}/100`} />
+        <div style={{ ...small, margin: "4px 0 8px", color: C.textMuted }}>{fl.note}</div>
+        {fl.factors.map((f) => (
+          <div key={f.name} style={{ display: "flex", gap: 8, fontSize: 11.5, padding: "2px 0", color: f.available ? C.text : C.textDim }}>
+            <span style={{ flex: "0 0 130px" }}>{f.name}</span>
+            <span style={{ flex: 1, fontSize: 10.5, color: C.textDim }}>{f.text}</span>
           </div>
         ))}
-        <div style={{ ...small, marginTop: 4 }}>A break only counts when a candle closes beyond the zone on above-average volume; a wick through the zone is treated as a rejection.</div>
+        <div style={{ ...small, marginTop: 6 }}>
+          Inferred from price, volume, open interest, taker flow, long/short ratio and funding — it cannot prove that large traders are buying or selling. Distinguishes accumulation, short covering, distribution and long liquidation.
+        </div>
+      </div>
+
+      {[["Breakout", bo, "False breakout risk"], ["Breakdown", bd, "Bear trap risk"]].map(([name, b, riskName]) => (
+        <div key={name} style={sectionStyle}>
+          <div style={head}>{name}</div>
+          <Row k={`${name} status`} v={b.status} color={/confirmed/i.test(b.status) ? C.amber : C.text} sub={`${b.zone ? `zone ${b.zoneLabel ? b.zoneLabel + " " : ""}${fmtPrice(b.zone.mid)} · ` : ""}${b.note}`} />
+          <Checks b={b} />
+          <Row k={`${name} probability`} v={`${b.probability}/100`} />
+          <Row k="Volume confirmation" v={b.volume} />
+          <Row k="Retest confirmation" v={b.retest} />
+          <Row k={riskName} v={`${b.risk}/100`} color={riskColor(b.risk)} />
+        </div>
+      ))}
+      <div style={{ ...small, marginBottom: 14 }}>
+        A break only counts when a candle closes beyond the zone with meaningful distance, above-normal volume, and price holds. A wick through the zone is a rejection, not a breakout. Breakout levels use the same S/R zones listed above.
       </div>
 
       <div
@@ -4138,13 +4194,13 @@ function AnalysisReport({ an, result, showHelp, setShowHelp }) {
       {showHelp && (
         <div style={{ ...small, fontSize: 10.5, marginBottom: 14, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
           <div style={{ marginBottom: 5 }}>
-            Read only from the {an.n} × {result.intervalLabel} candles you chose. Settings scaled to that length: EMA{an.params.emaFastP}/{an.params.emaSlowP}, RSI{an.params.rsiP}, ADX{an.params.adxP}, MACD {an.params.macdFastP}/{an.params.macdSlowP}/{an.params.macdSigP}, swings need {an.params.swingK} candles each side (so the newest {an.params.swingK} candles can't form a swing yet).
+            Scored on exactly the {an.n} × {result.intervalLabel} candles you chose. {an.warmup > 0 ? `${an.warmup} earlier candles were downloaded only so EMA / RSI / MACD / ADX are settled — they are not part of any trend, momentum, reversal, support, resistance or breakout score.` : "No earlier history was available, so indicator periods were scaled down."} Settings: EMA{an.params.emaFastP}/{an.params.emaSlowP}, RSI{an.params.rsiP}, ADX{an.params.adxP}, MACD {an.params.macdFastP}/{an.params.macdSlowP}/{an.params.macdSigP}; swings need {an.params.swingK} candles each side, so the newest {an.params.swingK} can't form a swing yet.
           </div>
-          <div style={{ marginBottom: 5 }}>Trend — UP/DOWN when 2 of 3 agree: EMA alignment, price slope (regression), market structure; otherwise SIDEWAYS.</div>
-          <div style={{ marginBottom: 5 }}>Strength — ADX 40% · EMA alignment 20% · slope fit 20% · structure 20%. Under 20 Very Weak, then Weak, Moderate, Strong, 80+ Very Strong.</div>
-          <div style={{ marginBottom: 5 }}>Momentum — RSI, MACD, rate of change, volume flow, candle bodies; 3 of 5 must agree or it stays Neutral.</div>
-          <div style={{ marginBottom: 5 }}>Support / Resistance — repeated swing lows/highs and rejection wicks clustered into zones, scored by touches, wicks, volume and recency; S1/R1 is the nearest of the strongest.</div>
-          <div>Overall score — blends trend, momentum, structure, reversal and breakout evidence; the lean is only called Confirmed when 5+ of 6 independent groups agree. This is analysis, not a buy or sell signal.</div>
+          <div style={{ marginBottom: 5 }}>Overall trend — structure 30% · price slope 30% · EMA alignment 20% · recent direction 20%; a large clean move (high R²) counts as a trend even when swings are mixed. Current condition compares the last third of the period to that.</div>
+          <div style={{ marginBottom: 5 }}>Strength — structure 30% · slope 20% · EMA 20% · ADX 20% · consistency 10%.</div>
+          <div style={{ marginBottom: 5 }}>Momentum — RSI, MACD histogram, rate of change, volume flow and candle bodies are each classed bullish / bearish / neutral; 3+ must agree or it shows Mixed / Weak.</div>
+          <div style={{ marginBottom: 5 }}>Support / resistance — swing points, rejection wicks, flipped breakout levels and consolidation clustered into zones, scored on touches, wicks, volume, recency, consolidation and flips.</div>
+          <div>This is analysis of the candles you chose, not a buy or sell signal.</div>
         </div>
       )}
     </>
@@ -4196,6 +4252,8 @@ function DeepAnalysis({ rows, funding, logos }) {
       return;
     }
     const need = n * plan.ratio;
+    // extra history used ONLY to settle EMA / RSI / MACD / ADX — never scored
+    const warmN = Math.max(0, Math.min(DEEP_WARMUP, Math.floor(MAX_BASE_CANDLES / plan.ratio) - n));
     if (need > MAX_BASE_CANDLES) {
       setError(
         plan.ratio > 1
@@ -4214,7 +4272,7 @@ function DeepAnalysis({ rows, funding, logos }) {
     setResult(null);
     setAthState({ status: "idle", data: null });
     try {
-      const baseCandles = await fetchKlinesN(symbol, plan.base, need);
+      const baseCandles = await fetchKlinesN(symbol, plan.base, (n + warmN) * plan.ratio);
       const candles = aggregateCandles(baseCandles, plan.ratio);
       if (candles.length < 2) throw new Error("Binance has too little history for this pair at that interval.");
       const win = candles.slice(-n);
@@ -4240,7 +4298,6 @@ function DeepAnalysis({ rows, funding, logos }) {
         lowTime: win[loIdx][0],
         changePct: ((closeLast - openFirst) / openFirst) * 100,
         quoteVolume: win.reduce((a, k) => a + parseFloat(k[7]), 0),
-        an: analyzeCandles(win),
       };
 
       const [extrasS, posS, fundS] = await Promise.allSettled([
@@ -4252,6 +4309,11 @@ function DeepAnalysis({ rows, funding, logos }) {
       stats.oi = extrasS.status === "fulfilled" ? extrasS.value?.multiExchange?.binance?.oi ?? null : null;
       stats.positioning = posS.status === "fulfilled" ? posS.value : null;
       stats.fundingHours = fundS.status === "fulfilled" ? fundS.value : 8;
+      stats.an = analyzeCandles(candles, win.length, {
+        oiChangePct: stats.positioning?.oiChangePct ?? null,
+        longPct: stats.positioning?.globalLongPct ?? null,
+        fundingRate: funding[symbol]?.rate ?? null,
+      });
       setResult(stats);
       setStatus("done");
 
