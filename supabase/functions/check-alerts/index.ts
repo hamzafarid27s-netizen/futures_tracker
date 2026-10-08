@@ -232,10 +232,8 @@ Deno.serve(async (req: Request) => {
     // threshold was just crossed) — never on every evaluation while the
     // condition stays true, which is what caused the same alert to repeat
     // every cooldown period for as long as a move or a trade stayed past
-    // its threshold. ROI/PNL trade-target alerts also notify on the
-    // reverse transition — true→false (value crossed back through the
-    // target) — since those are meant to tell the user both when a target
-    // is reached AND when it's given back.
+    // its threshold. ROI/PNL trade-target alerts also notify only when the
+    // target is hit; moving back past it re-arms the alert silently.
     // Paginated: PostgREST caps a single select at 1000 rows, and this table
     // grows past that (one row per pair per default rule per device). A
     // truncated read made later rows (e.g. funding keys) look "never fired"
