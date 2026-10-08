@@ -1186,11 +1186,9 @@ export default function FuturesTracker() {
   }, [rows, rulesEnabled, customAlerts, globalAlerts, detailData, changeFromBuffer, fireAlert, globalRulesMasterOn, otherAlertsMasterOn, defaultRulePcts]);
 
   // ---- saved trade PnL sign-flip + ROI%/PNL$ target notifications ----
-  // ROI/PNL targets are edge-triggered both directions: fire once on
-  // crossing INTO the target, and fire again if the value later crosses
-  // back OUT of it (e.g. ROI climbs past +10% then drops back under +10%)
-  // — a reversal is just as notification-worthy as reaching the target in
-  // the first place, and this also stops the multi-notification pileup
+  // ROI/PNL targets notify ONLY when the value hits the target you set.
+  // Moving back past it re-arms the alert silently (no second message).
+  // Edge-triggering also stops the multi-notification pileup
   // that happened when several thresholds were satisfied at once, since
   // each threshold now fires once per crossing rather than on every tick.
   useEffect(() => {
@@ -1221,8 +1219,7 @@ export default function FuturesTracker() {
           activeT[key] = true;
           fireTradeThreshold(t, "roi", a.pct, roi, "hit");
         } else if (was && !staysPastThreshold(roi, a.pct, hysteresisBuffer(a.pct))) {
-          activeT[key] = false;
-          fireTradeThreshold(t, "roi", a.pct, roi, "reversed");
+          activeT[key] = false; // re-arm silently — only hits notify
         }
       });
       (t.pnlAlerts || []).forEach((a) => {
@@ -1232,8 +1229,7 @@ export default function FuturesTracker() {
           activeT[key] = true;
           fireTradeThreshold(t, "pnl", a.value, pnlUsdt, "hit");
         } else if (was && !staysPastThreshold(pnlUsdt, a.value, hysteresisBuffer(a.value))) {
-          activeT[key] = false;
-          fireTradeThreshold(t, "pnl", a.value, pnlUsdt, "reversed");
+          activeT[key] = false; // re-arm silently — only hits notify
         }
       });
 

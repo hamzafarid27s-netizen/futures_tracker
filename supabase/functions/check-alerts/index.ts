@@ -447,10 +447,8 @@ Deno.serve(async (req: Request) => {
 
           // Custom ROI% targets — signed threshold: positive fires on rising
           // to/above that gain, negative fires on dropping to/below that
-          // loss. Edge-triggered both ways: fires once when the target is
-          // reached, AND fires again if ROI later crosses back through it
-          // (e.g. climbs above +10% then drops back under +10%), instead of
-          // only ever firing on the way in.
+          // loss. Notifies ONLY when the target is hit; moving back past it
+          // just re-arms the alert silently (no "back past target" message).
           for (const a of t.roiAlerts ?? []) {
             if (roi === null) continue;
             evalEdge(
@@ -461,16 +459,12 @@ Deno.serve(async (req: Request) => {
               () => ({
                 title: `${t.symbol.replace("USDT", "/USDT")} ROI target hit`,
                 body: `Target ${a.pct >= 0 ? "+" : ""}${a.pct}% · now ${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`,
-              }),
-              () => ({
-                title: `${t.symbol.replace("USDT", "/USDT")} ROI back past target`,
-                body: `Target ${a.pct >= 0 ? "+" : ""}${a.pct}% · now ${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`,
               })
             );
           }
 
           // Custom PNL (USDT) targets — same signed-threshold convention and
-          // same two-way edge triggering as ROI targets above.
+          // same hit-only notification as ROI targets above.
           for (const a of t.pnlAlerts ?? []) {
             evalEdge(
               deviceId,
@@ -479,10 +473,6 @@ Deno.serve(async (req: Request) => {
               a.value,
               () => ({
                 title: `${t.symbol.replace("USDT", "/USDT")} PNL target hit`,
-                body: `Target ${a.value >= 0 ? "+" : ""}${a.value} USDT · now ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT`,
-              }),
-              () => ({
-                title: `${t.symbol.replace("USDT", "/USDT")} PNL back past target`,
                 body: `Target ${a.value >= 0 ? "+" : ""}${a.value} USDT · now ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT`,
               })
             );
