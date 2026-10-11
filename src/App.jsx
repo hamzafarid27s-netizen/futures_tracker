@@ -3,6 +3,7 @@ import { supabase, isBackgroundAlertsConfigured } from "./supabaseClient";
 import { analyzeCandles, MIN_ANALYSIS_CANDLES } from "./deepAnalysis";
 import { createRadarScanner, orderSymbols } from "./radarScanner";
 import { STATUS, DEFAULT_SETTINGS } from "./entryRadar";
+import { evaluateSmartEntry, positionSize, symbolCheck, SMART_STATUS, SMART_DEFAULTS, NO_VALID_ZONE } from "./smartEntry";
 
 const DARK_THEME = {
   bg: "#0B0F14",
@@ -357,7 +358,7 @@ export default function FuturesTracker() {
   const [newAlertForm, setNewAlertForm] = useState({ symbol: "", min: 60, pct: 5, dir: "either" });
   const [analyzeSymbol, setAnalyzeSymbol] = useState(null);
   const [analyzePrefill, setAnalyzePrefill] = useState(null); // symbol sent from Entry Radar
-  const openAnalyzeFromRadar = (sym) => { setAnalyzePrefill({ symbol: sym, n: Date.now() }); setTab("analyze"); };
+  const openAnalyzeFromRadar = (sym) => { setAnalyzePrefill({ symbol: sym, n: Date.now(), section: "smart" }); setTab("analyze"); };
   const [coinLogos, setCoinLogos] = useState({});
   const [savedTrades, setSavedTrades] = useState([]); // {id, symbol, entry, margin, leverage, dir, roiAlerts:[{id,pct}], pnlAlerts:[{id,value}]}
   const [athAtlMap, setAthAtlMap] = useState({}); // symbol -> {ath, athTime, atl, atlTime, ...} (1d)
@@ -3789,8 +3790,477 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
   );
 }
 
+// ===================== Smart Entry Zone (Analyze page) =====================
+// UI only. All maths lives in smartEntry.js (unit-tested); data comes from the
+// shared radar scanner (cache, de-duplication, bounded concurrency, 418/429 handling).
+
+const SMART_DEFAULT_CFG = { account: 1000, riskPct: 1, leverage: 10, feePct: 0.05, slippagePct: 0.03, fiveMin: false, tf: "1h" };
+
+function smartStatusStyle(status) {
+  if (status === SMART_STATUS.LONG_TRIGGERED) return { color: "#0B1A12", bg: C.gain };
+  if (status === SMART_STATUS.SHORT_TRIGGERED) return { color: "#1D0B0B", bg: C.loss };
+  if (status === SMART_STATUS.IN_ZONE) return { color: C.amber, bg: "rgba(245,166,35,0.16)" };
+  if (status === SMART_STATUS.WAIT_ZONE) return { color: C.blue, bg: "rgba(79,156,255,0.12)" };
+  if (status === SMART_STATUS.INVALIDATED || status === SMART_STATUS.MISSED) return { color: C.loss, bg: C.lossBg };
+  if (status === SMART_STATUS.STALE) return { color: C.amber, bg: "rgba(245,166,35,0.12)" };
+  return { color: C.textMuted, bg: C.panelAlt };
+}
+const fmtClock = (t) => (t ? new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "UNAVAILABLE");
+
+// Candlestick chart with the entry-zone band, preferred entry, stop, invalidation,
+// targets and key support/resistance. Pure SVG, scales to the container width.
+function SmartEntryChart({ frame, plan, price, keyLevels, tf }) {
+  if (!frame || !frame.closed || frame.closed.length < 10) {
+    return <div style={{ fontSize: 12, color: C.textMuted, padding: 12 }}>Chart UNAVAILABLE — not enough {tf.toUpperCase()} candles.</div>;
+  }
+  const W = 720, H = 330, padL = 8, padR = 92, padT = 12, padB = 24;
+  const N = 70;
+  const candles = [...frame.closed.slice(-N)];
+  if (frame.forming) candles.push({ ...frame.forming, forming: true });
+  const lines = [];
+  if (plan && plan.valid) {
+    lines.push({ p: plan.entry, c: C.amber, d: "", label: "Entry" });
+    lines.push({ p: plan.stop, c: C.loss, d: "", label: "Stop" });
+    lines.push({ p: plan.invalidation, c: "#FF9F5C", d: "4 3", label: "Invalid." });
+    plan.targets.forEach((t) => lines.push({ p: t.price, c: C.gain, d: "6 3", label: t.label }));
+  }
+  const vals = candles.flatMap((c) => [c.h, c.l]).concat(lines.map((l) => l.p), plan && plan.zone ? [plan.zone.lo, plan.zone.hi] : []);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const padV = (hi - lo) * 0.04 || hi * 0.01;
+  lo -= padV;
+  hi += padV;
+  const x = (i) => padL + ((W - padL - padR) * (i + 0.5)) / candles.length;
+  const y = (p) => padT + ((hi - p) / (hi - lo)) * (H - padT - padB);
+  const bw = Math.max(2, ((W - padL - padR) / candles.length) * 0.62);
+  const levels = (keyLevels || []).filter((z) => z.hi >= lo && z.lo <= hi);
+  const fmt = (p) => fmtPrice(p);
+  // keep price labels from overlapping: nudge down when closer than 11px
+  const labelled = [...lines].sort((a, b) => y(a.p) - y(b.p));
+  let lastY = -99;
+  labelled.forEach((l) => {
+    let ly = y(l.p);
+    if (ly - lastY < 11) ly = lastY + 11;
+    l.ly = ly;
+    lastY = ly;
+  });
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block", background: C.panelAlt, borderRadius: 8 }} role="img" aria-label="Candlestick chart with entry zone, stop and targets">
+      {levels.map((z, i) => (
+        <rect key={"sr" + i} x={padL} width={W - padL - padR} y={y(Math.max(z.hi, z.lo + (hi - lo) * 0.002))} height={Math.max(1.5, y(z.lo) - y(Math.max(z.hi, z.lo + (hi - lo) * 0.002)))} fill={C.textDim} opacity={0.14} />
+      ))}
+      {plan && plan.zone && (
+        <g>
+          <rect x={padL} width={W - padL - padR} y={y(plan.zone.hi)} height={Math.max(2, y(plan.zone.lo) - y(plan.zone.hi))} fill={plan.side === 1 ? C.gain : C.loss} opacity={0.2} />
+          <text x={padL + 4} y={y(plan.zone.hi) - 3} fontSize="10" fill={plan.side === 1 ? C.gain : C.loss} fontFamily={sans}>ENTRY ZONE {fmt(plan.zone.lo)} – {fmt(plan.zone.hi)}</text>
+        </g>
+      )}
+      {candles.map((c, i) => {
+        const up = c.c >= c.o;
+        const col = up ? C.gain : C.loss;
+        return (
+          <g key={c.t} opacity={c.forming ? 0.55 : 1}>
+            <line x1={x(i)} x2={x(i)} y1={y(c.h)} y2={y(c.l)} stroke={col} strokeWidth="1" />
+            <rect x={x(i) - bw / 2} y={y(Math.max(c.o, c.c))} width={bw} height={Math.max(1, Math.abs(y(c.o) - y(c.c)))} fill={c.forming ? "none" : col} stroke={col} strokeWidth="1" strokeDasharray={c.forming ? "2 2" : ""} />
+          </g>
+        );
+      })}
+      {lines.map((l) => (
+        <line key={l.label} x1={padL} x2={W - padR} y1={y(l.p)} y2={y(l.p)} stroke={l.c} strokeWidth="1.2" strokeDasharray={l.d} />
+      ))}
+      {labelled.map((l) => (
+        <text key={"t" + l.label} x={W - padR + 4} y={l.ly + 3} fontSize="10" fill={l.c} fontFamily={mono}>{l.label} {fmt(l.p)}</text>
+      ))}
+      {isFinite(price) && (
+        <g>
+          <line x1={padL} x2={W - padR} y1={y(price)} y2={y(price)} stroke={C.text} strokeWidth="0.8" strokeDasharray="1 3" opacity={0.7} />
+          <text x={W - padR + 4} y={y(price) - 4} fontSize="10" fill={C.text} fontFamily={mono}>Now {fmt(price)}</text>
+        </g>
+      )}
+      <text x={padL + 2} y={H - 8} fontSize="10" fill={C.textDim} fontFamily={sans}>
+        {tf.toUpperCase()} · last confirmed candle {fmtClock(frame.last && frame.last.t)} · dashed candle = still forming · grey bands = confirmed S/R
+      </text>
+    </svg>
+  );
+}
+
+function SmartEntryPanel({ rows, funding, logos, symbolText, setSymbolText }) {
+  const scanner = getRadarScanner();
+  const [cfg, setCfg] = useState(SMART_DEFAULT_CFG);
+  const cfgLoaded = useRef(false);
+  const [side, setSide] = useState(null); // null = follow the stronger side
+  const [load, setLoad] = useState({ state: "idle", error: null, rateLimited: false });
+  const [check, setCheck] = useState(null); // { ok, reason }
+  const [version, setVersion] = useState(0);
+  const [tick, setTick] = useState(0);
+  const [rowsAt, setRowsAt] = useState(Date.now());
+  const [showHelp, setShowHelp] = useState(false);
+  const [showSizing, setShowSizing] = useState(true);
+  const reqId = useRef(0);
+
+  useEffect(() => {
+    (async () => {
+      const saved = await safeStorageGet("smart-settings");
+      if (saved) setCfg((c) => ({ ...c, ...saved }));
+      cfgLoaded.current = true;
+    })();
+  }, []);
+  useEffect(() => {
+    if (cfgLoaded.current) safeStorageSet("smart-settings", cfg);
+  }, [cfg]);
+  useEffect(() => setRowsAt(Date.now()), [rows]);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  const symbol = useMemo(() => {
+    const s = (symbolText || "").trim().toUpperCase();
+    if (!s) return null;
+    return s.endsWith("USDT") ? s : s + "USDT";
+  }, [symbolText]);
+  const row = useMemo(() => (symbol ? rows.find((r) => r.symbol === symbol) || null : null), [rows, symbol]);
+  const tfs = useMemo(() => (cfg.fiveMin ? ["4h", "1h", "15m", "5m"] : ["4h", "1h", "15m"]), [cfg.fiveMin]);
+
+  // Load (and keep fresh) data for the selected symbol. Rapid symbol changes: the debounce
+  // plus request token mean only the latest selection updates the screen, and the scanner
+  // de-duplicates identical in-flight requests.
+  const loadSymbol = useCallback(
+    async (sym, { quiet = false } = {}) => {
+      const my = ++reqId.current;
+      if (!quiet) setLoad({ state: "loading", error: null, rateLimited: false });
+      try {
+        const info = await scanner.loadExchangeInfo();
+        if (my !== reqId.current) return;
+        const chk = symbolCheck(sym, info.statusMap || Object.fromEntries(info.symbols.map((s) => [s.symbol, { status: "TRADING", contractType: "PERPETUAL", quoteAsset: "USDT" }])));
+        setCheck(chk);
+        if (!chk.ok) {
+          setLoad({ state: "invalid", error: chk.reason, rateLimited: false });
+          return;
+        }
+        // selected symbol first: its three requests go out together, before anything else queues
+        await Promise.all([...tfs.map((tf) => scanner.getKlines(sym, tf)), scanner.loadBook()]);
+        if (my !== reqId.current) return;
+        setLoad({ state: "live", error: null, rateLimited: false, at: Date.now() });
+        setVersion((v) => v + 1);
+      } catch (e) {
+        if (my !== reqId.current) return;
+        const rl = !!(e && (e.rateLimited || /HTTP (418|429)/.test(String(e.message))));
+        setLoad((l) => ({ state: l.state === "live" ? "live" : "error", error: rl ? `Binance is rate-limiting this connection — retrying automatically in about ${binanceBlockedSecondsLeft() || 60}s.` : String(e && e.message ? e.message : e), rateLimited: rl, at: l.at }));
+      }
+    },
+    [scanner, tfs]
+  );
+  useEffect(() => {
+    if (!symbol) {
+      setLoad({ state: "idle", error: null, rateLimited: false });
+      setCheck(null);
+      return undefined;
+    }
+    const id = setTimeout(() => loadSymbol(symbol), 350);
+    return () => clearTimeout(id);
+  }, [symbol, loadSymbol]);
+  // levels update as candles close: the scanner only re-downloads when a new candle has opened
+  useEffect(() => {
+    if (!symbol || !check || !check.ok) return undefined;
+    const id = setInterval(() => loadSymbol(symbol, { quiet: true }), 20000);
+    return () => clearInterval(id);
+  }, [symbol, check, loadSymbol]);
+
+  const settings = useMemo(() => ({ ...SMART_DEFAULTS, feePct: Number(cfg.feePct) || 0, slippagePct: Number(cfg.slippagePct) || 0 }), [cfg.feePct, cfg.slippagePct]);
+
+  const ev = useMemo(() => {
+    if (!symbol || !row || load.state === "idle" || load.state === "invalid") return null;
+    if (!scanner.hasKlines(symbol, tfs)) return null;
+    const { frames, ages, fetchedAt } = scanner.getFrames(symbol, tfs);
+    const book = scanner._cache.book && scanner._cache.book.map ? scanner._cache.book.map[symbol] || null : null;
+    const r = evaluateSmartEntry({
+      symbol,
+      frames,
+      live: { ticker: { lastPrice: row.lastPrice, priceChangePercent: row.priceChangePercent, quoteVolume: row.quoteVolume }, book },
+      ages: { ...ages, ticker: Date.now() - rowsAt },
+      settings,
+      now: Date.now(),
+    });
+    r.frames = frames;
+    r.fetchedAt = fetchedAt;
+    return r;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, row, load.state, version, settings, tick, tfs, scanner]);
+
+  const set = (k, v) => setCfg((c) => ({ ...c, [k]: v }));
+  const inputStyle = { ...selStyle(), padding: "9px 10px", fontSize: 13, width: "100%", boxSizing: "border-box" };
+  const lab = { fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", fontWeight: 700, marginBottom: 3 };
+  const price = ev && ev.price;
+
+  const active = ev && ev.ok ? (side === 1 ? ev.long : side === -1 ? ev.short : ev.primary === -1 ? ev.short : ev.long) : null;
+  const activeSide = active ? active.side : null;
+
+  const sizing = useMemo(() => {
+    if (!active || !active.plan.valid) return null;
+    return positionSize({ account: cfg.account, riskPct: cfg.riskPct, leverage: cfg.leverage, entry: active.plan.entry, stop: active.plan.stop, side: active.side, settings });
+  }, [active, cfg.account, cfg.riskPct, cfg.leverage, settings]);
+
+  const Row = ({ k, children, color }) => (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "5px 0", borderBottom: `1px solid ${C.border}`, fontSize: 12.5 }}>
+      <span style={{ color: C.textMuted }}>{k}</span>
+      <span style={{ fontFamily: mono, color: color || C.text, textAlign: "right" }}>{children}</span>
+    </div>
+  );
+
+  const staleAge = ev && ev.ok ? Math.max(ev.ages["15m"] ?? 0, ev.ages.ticker ?? 0) : 0;
+
+  return (
+    <div>
+      <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 14, lineHeight: 1.5 }}>
+        Smart Entry Zone shows where a LONG or SHORT could be planned, built from real Binance candles: confluence zones, a completed-candle trigger, invalidation, stop and targets. It is a planning aid — never a promise of a perfect entry or profit, and nothing is traded for you.
+      </div>
+
+      <Card title="Pair">
+        <SymbolPicker rows={rows} logos={logos} value={symbolText} onChange={setSymbolText} onSelect={(s) => setSymbolText(s.replace("USDT", ""))} placeholder="Pair, e.g. BTC — tap to browse" />
+        {symbol && row && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 12.5, fontFamily: mono, color: C.textMuted, marginTop: 10 }}>
+            <CoinIcon symbol={symbol} logos={logos} />
+            <span style={{ color: C.text, fontWeight: 700 }}>{symbol.replace("USDT", "/USDT")}</span>
+            <span style={{ color: C.text }}>{fmtPrice(parseFloat(row.lastPrice))}</span>
+            <span style={{ color: pctColor(parseFloat(row.priceChangePercent)) }}>{fmtPct(parseFloat(row.priceChangePercent))}</span>
+          </div>
+        )}
+        {symbol && !row && rows.length > 0 && <div style={{ fontSize: 12.5, color: C.loss, marginTop: 10 }}>{symbol} is not in the live USDT futures list. Check the spelling.</div>}
+      </Card>
+
+      {!symbol && <div style={{ fontSize: 12.5, color: C.textMuted, padding: "6px 2px 14px" }}>Pick a pair to calculate its entry zones.</div>}
+      {load.state === "loading" && !ev && <div style={{ fontSize: 12.5, color: C.textMuted, padding: "6px 2px 14px" }}>Loading 4H / 1H / 15m candles from Binance…</div>}
+      {load.state === "invalid" && (
+        <div style={{ border: `1px solid ${C.loss}`, background: C.lossBg, color: C.loss, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, marginBottom: 14 }}>{load.error}</div>
+      )}
+      {load.error && load.state !== "invalid" && (
+        <div style={{ border: `1px solid ${C.amber}`, background: "rgba(245,166,35,0.1)", color: C.amber, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, marginBottom: 14 }}>
+          {load.error}
+          {ev && ev.ok ? " Showing the last data received." : ""}
+        </div>
+      )}
+
+      {ev && !ev.ok && (
+        <Card title="Smart Entry Zone">
+          <span style={{ display: "inline-block", padding: "4px 9px", borderRadius: 6, fontSize: 11.5, fontWeight: 800, color: C.textMuted, background: C.panelAlt }}>NO TRADE · INSUFFICIENT DATA</span>
+          <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 8 }}>{ev.reason}. Nothing is estimated or invented when data is missing.</div>
+        </Card>
+      )}
+
+      {ev && ev.ok && active && (
+        <>
+          {/* header: timeframe stack + data source */}
+          <Card title="Smart Entry Zone" right={<span style={{ fontSize: 11, color: C.textDim, fontFamily: mono }}>{symbol}</span>}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 12 }}>
+              <div style={{ background: C.panelAlt, borderRadius: 8, padding: "9px 11px" }}>
+                <div style={lab}>4H trend (primary)</div>
+                <div style={{ fontFamily: mono, fontWeight: 700, color: ev.t4.dir === 1 ? C.gain : ev.t4.dir === -1 ? C.loss : C.textMuted }}>{ev.t4.label} <span style={{ color: C.textDim, fontWeight: 400 }}>· strength {ev.t4.strength}</span></div>
+              </div>
+              <div style={{ background: C.panelAlt, borderRadius: 8, padding: "9px 11px" }}>
+                <div style={lab}>1H setup (context)</div>
+                <div style={{ fontFamily: mono, fontWeight: 700, color: ev.structure1h === "BULLISH" ? C.gain : ev.structure1h === "BEARISH" ? C.loss : C.textMuted }}>{ev.structure1h}</div>
+              </div>
+              <div style={{ background: C.panelAlt, borderRadius: 8, padding: "9px 11px" }}>
+                <div style={lab}>15m trigger</div>
+                <div style={{ fontFamily: mono, fontWeight: 700, color: active.trigger && active.trigger.confirmed ? (activeSide === 1 ? C.gain : C.loss) : C.textMuted }}>
+                  {active.trigger ? (active.trigger.confirmed ? `CONFIRMED · ${active.trigger.kind}` : active.provisional ? "PROVISIONAL (candle open)" : "NOT CONFIRMED") : "UNAVAILABLE"}
+                </div>
+              </div>
+            </div>
+            <div style={{ fontSize: 11, color: C.textDim, lineHeight: 1.6 }}>
+              Source: Binance USDⓈ-M public API (exchangeInfo, klines, 24h ticker, bookTicker) — no API key used. Last confirmed candle: 4H {fmtClock(ev.lastClosed["4h"])} · 1H {fmtClock(ev.lastClosed["1h"])} · 15m {fmtClock(ev.lastClosed["15m"])}. Candles fetched {radarAge(ev.fetchedAt["15m"] ? Date.now() - ev.fetchedAt["15m"] : null)} ago · price {radarAge(ev.ages.ticker)} old · levels are DERIVED and refresh when a candle closes.
+              {ev.stale && <span style={{ color: C.amber, fontWeight: 700 }}> DATA STALE ({radarAge(staleAge)} behind).</span>}
+              {ev.flags.filter((f) => f !== "DATA STALE").map((f) => (
+                <span key={f} style={{ marginLeft: 6, color: C.amber, border: `1px solid ${C.amber}`, borderRadius: 4, padding: "0 4px", fontSize: 9.5 }}>{f}</span>
+              ))}
+            </div>
+          </Card>
+
+          {/* LONG / SHORT tabs */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+            {[[1, "LONG", ev.long], [-1, "SHORT", ev.short]].map(([s, label, r]) => {
+              const on = activeSide === s;
+              const st = smartStatusStyle(r.status);
+              return (
+                <button key={label} className="ft-btn" onClick={() => setSide(s)} style={{ flex: 1, textAlign: "left", background: on ? C.panelRaised : C.panel, border: `1px solid ${on ? (s === 1 ? C.gain : C.loss) : C.border}`, borderRadius: 10, padding: "10px 12px", color: C.text }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <b style={{ color: s === 1 ? C.gain : C.loss, fontSize: 14 }}>{label}</b>
+                    <span style={{ fontFamily: mono, fontWeight: 800, fontSize: 16 }}>{r.plan.valid ? r.score : "—"}<span style={{ fontSize: 9.5, color: C.textDim, fontWeight: 600 }}>{r.plan.valid ? "/100" : ""}</span></span>
+                  </div>
+                  <span style={{ display: "inline-block", marginTop: 6, padding: "2px 7px", borderRadius: 5, fontSize: 10, fontWeight: 800, color: st.color, background: st.bg, fontFamily: sans }}>{r.label && r.status === SMART_STATUS.NO_TRADE ? `${r.status} · ${r.label}` : r.status}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <Card title={`${activeSide === 1 ? "LONG" : "SHORT"} plan`} right={<span style={{ fontSize: 10.5, color: C.textDim }}>heuristic — not a promise</span>}>
+            {(() => {
+              const st = smartStatusStyle(active.status);
+              return (
+                <div style={{ marginBottom: 10 }}>
+                  <span style={{ display: "inline-block", padding: "4px 9px", borderRadius: 6, fontSize: 11.5, fontWeight: 800, color: st.color, background: st.bg, fontFamily: sans }}>{active.status}</span>
+                  {active.hint && <span style={{ marginLeft: 8, fontSize: 11, color: C.amber, fontWeight: 700 }}>{active.hint}</span>}
+                  {active.provisional && <span style={{ marginLeft: 8, fontSize: 11, color: C.amber, fontWeight: 700 }}>PROVISIONAL — candle not closed</span>}
+                  <div style={{ fontSize: 12, color: C.textMuted, marginTop: 6, lineHeight: 1.5 }}>{active.reason}</div>
+                </div>
+              );
+            })()}
+
+            {!active.plan.valid ? (
+              <div style={{ border: `1px dashed ${C.border}`, borderRadius: 8, padding: "12px", fontSize: 12.5, color: C.textMuted, lineHeight: 1.55 }}>
+                <b style={{ color: C.text }}>{active.label === "CONTEXT NOT SUPPORTIVE" ? "NOT SUPPORTED" : NO_VALID_ZONE}</b> — {active.plan.issues.join(" ") || active.reason}
+                <div style={{ marginTop: 6, color: C.textDim }}>The tool returns no zone rather than inventing one.</div>
+              </div>
+            ) : (
+              <>
+                <Row k="Entry zone">{fmtPrice(active.plan.zone.lo)} – {fmtPrice(active.plan.zone.hi)}</Row>
+                <Row k="Zone made of" color={C.textMuted}>{active.plan.zone.type}</Row>
+                <Row k="Preferred entry" color={C.amber}>{fmtPrice(active.plan.entry)}</Row>
+                <div style={{ fontSize: 11, color: C.textDim, padding: "4px 0 6px" }}>{active.plan.entryMethod}</div>
+                <Row k="Invalidation" color="#FF9F5C">{fmtPrice(active.plan.invalidation)}</Row>
+                <Row k="Stop loss" color={C.loss}>{fmtPrice(active.plan.stop)} <span style={{ color: C.textDim }}>({active.plan.riskPct.toFixed(2)}% risk)</span></Row>
+                {active.plan.targets.map((t) => (
+                  <Row key={t.label} k={t.label} color={C.gain}>{fmtPrice(t.price)} <span style={{ color: C.textDim, fontSize: 11 }}>· net R:R {t.rr !== null && t.rr !== undefined ? t.rr.toFixed(2) : "—"} · {t.source}</span></Row>
+                ))}
+                <Row k="Net risk/reward (TP2)" color={active.plan.rr2 >= 1.5 ? C.gain : active.plan.rr2 >= 1 ? C.amber : C.loss}>{active.plan.rr2 !== null && active.plan.rr2 !== undefined ? active.plan.rr2.toFixed(2) : "UNAVAILABLE"}</Row>
+                <div style={{ fontSize: 11, color: C.textDim, padding: "4px 0 8px" }}>After an assumed {(active.plan.costPct).toFixed(2)}% round-trip fees + slippage (editable below). A stop order can fill worse than its price.</div>
+                <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55 }}>
+                  <b style={{ color: C.text }}>Confirmation needed:</b> {active.trigger ? active.trigger.text : "UNAVAILABLE (not enough 15m candles)"}.
+                  {active.plan.retest && <div style={{ marginTop: 4 }}>Retest: {active.plan.retest.retested ? "held" : "not yet tested"}{active.plan.retest.volOk ? " · break was on volume" : ""}.</div>}
+                  {active.fine && <div style={{ marginTop: 4 }}>5m refinement: {active.fine.text}.</div>}
+                </div>
+              </>
+            )}
+          </Card>
+
+          {active.plan.valid && (
+            <Card
+              title="Chart"
+              right={
+                <div style={{ display: "flex", gap: 6 }}>
+                  {["1h", "15m"].map((t) => (
+                    <button key={t} className="ft-btn" onClick={() => set("tf", t)} style={{ background: cfg.tf === t ? C.amber : C.panel, color: cfg.tf === t ? "#1A1300" : C.textMuted, border: `1px solid ${cfg.tf === t ? C.amber : C.border}`, borderRadius: 6, padding: "3px 9px", fontSize: 11, fontWeight: 700 }}>{t.toUpperCase()}</button>
+                  ))}
+                </div>
+              }
+            >
+              <SmartEntryChart frame={ev.frames[cfg.tf]} plan={active.plan} price={price} keyLevels={ev.keyLevels} tf={cfg.tf} />
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", fontSize: 10.5, color: C.textMuted, marginTop: 8 }}>
+                <span><b style={{ color: activeSide === 1 ? C.gain : C.loss }}>▮</b> entry zone</span>
+                <span><b style={{ color: C.amber }}>━</b> preferred entry</span>
+                <span><b style={{ color: C.loss }}>━</b> stop</span>
+                <span><b style={{ color: "#FF9F5C" }}>┅</b> invalidation</span>
+                <span><b style={{ color: C.gain }}>┅</b> targets</span>
+                <span><b style={{ color: C.textDim }}>▮</b> confirmed S/R</span>
+              </div>
+            </Card>
+          )}
+
+          <Card title={`Zone quality · ${active.plan.valid ? active.score : "—"}/100`} right={<span style={{ fontSize: 10.5, color: C.textDim }}>ranking, NOT a win probability</span>}>
+            {active.plan.valid ? (
+              <>
+                {active.scoreDetail.components.map((c) => (
+                  <div key={c.key} style={{ marginBottom: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                      <span style={{ color: C.text }}>{c.name}</span>
+                      <span style={{ fontFamily: mono, color: C.textMuted }}>{c.points}/{c.weight}</span>
+                    </div>
+                    <div style={{ height: 5, background: C.panelAlt, borderRadius: 3, marginTop: 3 }}>
+                      <div style={{ height: 5, borderRadius: 3, width: `${Math.min(100, (c.points / c.weight) * 100)}%`, background: c.points / c.weight >= 0.6 ? C.gain : c.points / c.weight >= 0.3 ? C.amber : C.loss }} />
+                    </div>
+                    <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 2 }}>{c.note}</div>
+                  </div>
+                ))}
+                {active.scoreDetail.penalties.map((p) => (
+                  <div key={p.name} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.loss, gap: 8 }}>
+                    <span>{p.name}<span style={{ color: C.textDim }}> — {p.note}</span></span>
+                    <span style={{ fontFamily: mono }}>−{p.points}</span>
+                  </div>
+                ))}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 10, marginTop: 12 }}>
+                  <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ ...lab, color: C.gain }}>Supporting</div>
+                    {active.scoreDetail.reasons.for.length ? active.scoreDetail.reasons.for.map((t, i) => <div key={i} style={{ fontSize: 11.5, color: C.textMuted, lineHeight: 1.5, marginBottom: 3 }}>+ {t}</div>) : <div style={{ fontSize: 11.5, color: C.textDim }}>Nothing stands out as strong.</div>}
+                  </div>
+                  <div style={{ background: C.panelAlt, borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ ...lab, color: C.loss }}>Opposing / risks</div>
+                    {active.scoreDetail.reasons.against.length ? active.scoreDetail.reasons.against.map((t, i) => <div key={i} style={{ fontSize: 11.5, color: C.textMuted, lineHeight: 1.5, marginBottom: 3 }}>− {t}</div>) : <div style={{ fontSize: 11.5, color: C.textDim }}>No major objections found.</div>}
+                  </div>
+                </div>
+                <div style={{ fontSize: 11, color: C.textDim, marginTop: 10, lineHeight: 1.5 }}>
+                  Zone confluence (independent families only, each counted once): {active.plan.zone.members.map((m) => `${m.family}${m.historical ? " (historical level)" : ""}`).join(", ")}. Historical levels are where price reacted before; they are not confirmation. Only the completed-candle trigger above is current confirmation.
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 12.5, color: C.textMuted }}>No score because there is no valid plan on this side.</div>
+            )}
+          </Card>
+
+          {active.plan.valid && (
+            <Card title="Position size from your risk" right={<span onClick={() => setShowSizing((v) => !v)} className="ft-btn" style={{ fontSize: 11, color: C.textMuted }}>{showSizing ? "Hide" : "Show"}</span>}>
+              {showSizing && (
+                <>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 10, marginBottom: 12 }}>
+                    <label><div style={lab}>Account (USDT)</div><input type="number" min="0" value={cfg.account} onChange={(e) => set("account", e.target.value)} style={inputStyle} /></label>
+                    <label><div style={lab}>Risk per trade %</div><input type="number" min="0" step="0.1" value={cfg.riskPct} onChange={(e) => set("riskPct", e.target.value)} style={inputStyle} /></label>
+                    <label><div style={lab}>Leverage ×</div><input type="number" min="1" value={cfg.leverage} onChange={(e) => set("leverage", e.target.value)} style={inputStyle} /></label>
+                    <label><div style={lab}>Fee % / side</div><input type="number" min="0" step="0.01" value={cfg.feePct} onChange={(e) => set("feePct", e.target.value)} style={inputStyle} /></label>
+                    <label><div style={lab}>Slippage % / side</div><input type="number" min="0" step="0.01" value={cfg.slippagePct} onChange={(e) => set("slippagePct", e.target.value)} style={inputStyle} /></label>
+                  </div>
+                  {sizing ? (
+                    <>
+                      <Row k="Direction">{activeSide === 1 ? "LONG" : "SHORT"}</Row>
+                      <Row k="Risk budget">{sizing.riskAmount.toFixed(2)} USDT</Row>
+                      <Row k="Stop distance">{fmtPrice(sizing.stopDist)} <span style={{ color: C.textDim }}>(+ {fmtPrice(sizing.costPerUnit)} fees/slippage)</span></Row>
+                      <Row k="Position size" color={C.amber}>{sizing.qty < 1 ? sizing.qty.toPrecision(4) : sizing.qty.toFixed(3)} {symbol.replace("USDT", "")} · {sizing.notional.toFixed(2)} USDT</Row>
+                      <Row k={`Margin at ${sizing.leverage}×`}>{sizing.margin.toFixed(2)} USDT</Row>
+                      <Row k="Rough liquidation" color={sizing.liqBeforeStop ? C.loss : C.textMuted}>≈ {fmtPrice(sizing.liqApprox)}</Row>
+                      {sizing.warnings.map((w, i) => <div key={i} style={{ fontSize: 11.5, color: C.loss, marginTop: 6, lineHeight: 1.5 }}>⚠ {w}</div>)}
+                      <div style={{ fontSize: 11, color: C.textDim, marginTop: 8, lineHeight: 1.5 }}>{sizing.note}</div>
+                    </>
+                  ) : (
+                    <div style={{ fontSize: 12, color: C.textMuted }}>Enter an account size, risk % and leverage above zero to size the position.</div>
+                  )}
+                </>
+              )}
+            </Card>
+          )}
+
+          <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", fontSize: 12, color: C.textMuted, marginBottom: 10 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={cfg.fiveMin} onChange={(e) => set("fiveMin", e.target.checked)} /> include 5m entry refinement (information only, not scored)
+            </label>
+            <span onClick={() => loadSymbol(symbol)} className="ft-btn" style={{ color: C.amber, fontWeight: 700 }}>Refresh now</span>
+          </div>
+        </>
+      )}
+
+      {symbol && check && check.ok && (
+        <Card title="How it works" right={<span onClick={() => setShowHelp((v) => !v)} className="ft-btn" style={{ fontSize: 11, color: C.textMuted }}>{showHelp ? "Hide" : "Show"}</span>}>
+          {showHelp ? (
+            <div style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.65 }}>
+              <div style={{ marginBottom: 6 }}><b style={{ color: C.text }}>Data</b> — 4H trend, 1H zones, 15m trigger, optional 5m, all from closed candles; the open candle is only shown dashed and can at most make a status PROVISIONAL.</div>
+              <div style={{ marginBottom: 6 }}><b style={{ color: C.text }}>Zones</b> — levels from confirmed swing clusters, broken-and-retested levels, supply/demand bases, EMA 20/50/200, Fibonacci 0.382/0.5/0.618 of the latest confirmed swing, and a VWAP anchored at that swing, are merged only when within 0.35 × 1H ATR. Each family counts once, so related levels are not double counted. A zone needs two independent families (or a strong multi-touch level); otherwise you see NO VALID ZONE.</div>
+              <div style={{ marginBottom: 6 }}><b style={{ color: C.text }}>Preferred entry</b> — where the most levels overlap inside the zone. <b style={{ color: C.text }}>Stop</b> — beyond the invalidation level plus 0.25 ATR. <b style={{ color: C.text }}>Targets</b> — confirmed opposing levels, otherwise 1.5R / 2.5R / 4R.</div>
+              <div style={{ marginBottom: 6 }}><b style={{ color: C.text }}>Statuses</b> — WAIT FOR ZONE → IN ZONE — WAIT FOR CONFIRMATION → LONG/SHORT TRIGGERED (completed 15m candle only). MISSED ENTRY, INVALIDATED (a closed candle or the stop level breached — a wick alone does not), NO TRADE and DATA STALE end or pause a setup. A signal does not repeat for the same setup.</div>
+              <div style={{ marginBottom: 6 }}><b style={{ color: C.text }}>Score</b> — trend 20, confluence 20, level quality 15, volume & momentum 15, volatility 10, net R:R 20, minus penalties. It ranks setups; it is not the chance of profit.</div>
+              <div><b style={{ color: C.text }}>Not available</b> — Binance Smart Money / whale positions, average entries and unrealised PNL are not public data and are never estimated or shown here. Values marked DERIVED are calculated here; UNAVAILABLE means Binance did not provide them.</div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 11.5, color: C.textDim }}>Formulas, assumptions and limits.</div>
+          )}
+        </Card>
+      )}
+
+      <div style={{ fontSize: 11, color: C.textDim, lineHeight: 1.55, marginBottom: 20 }}>
+        Not financial advice. Zones, stops and targets are derived from past candles and may not fill or hold; fees, slippage and funding vary. Trading futures with leverage can lose more than you expect. Nothing here places trades.
+      </div>
+    </div>
+  );
+}
+
 function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrades, setSavedTrades, logos, goToTrades, prefill }) {
-  const [section, setSection] = useState("setup"); // setup | deep
+  const [section, setSection] = useState("setup"); // setup | deep | smart
   const [justTracked, setJustTracked] = useState(null); // symbol just added to Trades
   const [form, setForm] = useState({ symbol: "", entry: "", margin: "", leverage: 10, dir: "long" });
   const [extras, setExtras] = useState(null);
@@ -3807,7 +4277,10 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
 
   // Symbol sent from Entry Radar
   useEffect(() => {
-    if (prefill?.symbol) setForm((f) => ({ ...f, symbol: prefill.symbol.replace(/USDT$/, "") }));
+    if (prefill?.symbol) {
+      setForm((f) => ({ ...f, symbol: prefill.symbol.replace(/USDT$/, "") }));
+      if (prefill.section) setSection(prefill.section);
+    }
   }, [prefill?.n]);
 
   const matchedRow = useMemo(() => {
@@ -4021,11 +4494,12 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
   const distFromAtl = current && athAtl?.atl ? ((current - athAtl.atl) / athAtl.atl) * 100 : null;
 
   return (
-    <div style={{ maxWidth: 480 }}>
+    <div style={{ maxWidth: section === "smart" ? 860 : 480 }}>
       <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
         {[
           ["setup", "Trade Setup"],
           ["deep", "Deep Analysis"],
+          ["smart", "Smart Entry"],
         ].map(([key, label]) => (
           <button
             key={key}
@@ -4048,6 +4522,16 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
       </div>
 
       {section === "deep" && <DeepAnalysis rows={rows} funding={funding} logos={logos} />}
+
+      {section === "smart" && (
+        <SmartEntryPanel
+          rows={rows}
+          funding={funding}
+          logos={logos}
+          symbolText={form.symbol}
+          setSymbolText={(v) => setForm((f) => ({ ...f, symbol: v, entry: "" }))}
+        />
+      )}
 
       {section === "setup" && (
         <>

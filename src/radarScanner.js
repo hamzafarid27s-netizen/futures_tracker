@@ -145,14 +145,18 @@ export function createRadarScanner(deps) {
   // ---------------------------------------------------------- exchange info
   async function loadExchangeInfo({ force = false } = {}) {
     const t = now();
-    if (!force && cache.exchange && t - cache.exchange.at < EXCHANGE_TTL) return { symbols: cache.exchange.symbols, at: cache.exchange.at, stale: false };
+    if (!force && cache.exchange && t - cache.exchange.at < EXCHANGE_TTL) return { symbols: cache.exchange.symbols, at: cache.exchange.at, stale: false, statusMap: cache.exchange.statusMap };
     try {
       const data = await dedupe("exchangeInfo", () => request(`${base}/fapi/v1/exchangeInfo`, 1));
       if (!data || !Array.isArray(data.symbols)) throw new Error("Unexpected exchangeInfo response");
-      cache.exchange = { at: now(), symbols: filterEligible(data) };
-      return { symbols: cache.exchange.symbols, at: cache.exchange.at, stale: false };
+      const statusMap = {};
+      data.symbols.forEach((x) => {
+        if (x && typeof x.symbol === "string") statusMap[x.symbol] = { status: x.status, contractType: x.contractType, quoteAsset: x.quoteAsset };
+      });
+      cache.exchange = { at: now(), symbols: filterEligible(data), statusMap };
+      return { symbols: cache.exchange.symbols, at: cache.exchange.at, stale: false, statusMap };
     } catch (e) {
-      if (cache.exchange) return { symbols: cache.exchange.symbols, at: cache.exchange.at, stale: true, error: e.message };
+      if (cache.exchange) return { symbols: cache.exchange.symbols, at: cache.exchange.at, stale: true, error: e.message, statusMap: cache.exchange.statusMap };
       throw e;
     }
   }
@@ -335,7 +339,23 @@ export function createRadarScanner(deps) {
     return result;
   }
 
+  // Analysed frames + data ages for one symbol (used by Smart Entry Zone).
+  function getFrames(symbol, tfs = ["4h", "1h", "15m"]) {
+    const t = now();
+    const frames = {};
+    const ages = {};
+    const fetchedAt = {};
+    for (const tf of tfs) {
+      const f = frameFor(symbol, tf, t);
+      if (f) frames[tf] = f;
+      ages[tf] = behindMs(symbol, tf, t);
+      fetchedAt[tf] = cache.klines.get(`${symbol}|${tf}`)?.at ?? null;
+    }
+    return { frames, ages, fetchedAt, at: t };
+  }
+
   return {
+    getFrames,
     loadExchangeInfo,
     loadBook,
     getKlines,
