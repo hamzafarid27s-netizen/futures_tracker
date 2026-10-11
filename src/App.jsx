@@ -3049,6 +3049,7 @@ function getRadarScanner() {
       fapiFetch,
       waitForWeightHeadroom,
       blockedSecondsLeft: binanceBlockedSecondsLeft,
+      weightBudgetPerMin: 700,
     });
   }
   return radarScannerSingleton;
@@ -3463,7 +3464,9 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
   };
 
   const COLS = 14;
-  const Table = ({ title, color, list, empty }) => (
+  // plain function (not a component): a component defined here would be re-created on every
+  // render, which rebuilt the table DOM and reset its horizontal scroll to the first column
+  const renderTable = ({ title, color, list, empty }) => (
     <Card title={`${title} · ${list.length}`} style={{ padding: 0, overflow: "hidden" }}>
       {list.length === 0 ? (
         <div style={{ padding: "16px", fontSize: 12.5, color: C.textMuted }}>{empty}</div>
@@ -3651,8 +3654,8 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
         <Card><div style={{ fontSize: 12.5, color: C.textMuted }}>No results yet. Press “Scan now”.</div></Card>
       ) : (
         <>
-          <Table title="LONG OPPORTUNITIES" list={longs} empty="No LONG setups match the current filters. That is a valid answer — the radar does not force trades." />
-          <Table title="SHORT OPPORTUNITIES" list={shorts} empty="No SHORT setups match the current filters. That is a valid answer — the radar does not force trades." />
+          {renderTable({ title: "LONG OPPORTUNITIES", list: longs, empty: "No LONG setups match the current filters. That is a valid answer — the radar does not force trades." })}
+          {renderTable({ title: "SHORT OPPORTUNITIES", list: shorts, empty: "No SHORT setups match the current filters. That is a valid answer — the radar does not force trades." })}
           <Card title={`WAIT / NO TRADE / INSUFFICIENT DATA · ${waits.length}`} style={{ padding: 0, overflow: "hidden" }} right={<span onClick={() => setShowWait((v) => !v)} className="ft-btn" style={{ fontSize: 11, color: C.textMuted, padding: "12px 16px 0 0" }}>{showWait ? "Hide" : "Show"}</span>}>
             {showWait && (
               <div style={{ overflowX: "auto" }}>

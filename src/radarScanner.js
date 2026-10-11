@@ -66,10 +66,15 @@ export function createRadarScanner(deps) {
     blockedSecondsLeft = () => 0,
     now = () => Date.now(),
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-    concurrency = 4,
+    concurrency = 2,
     base = "https://fapi.binance.com",
     maxRetries = 3,
+    // Max request-weight the radar itself may spend in any rolling 60 s.
+    // The app's own polling shares the same Binance IP budget, so the radar
+    // stays well below it. Infinity = no self-limit (used by unit tests).
+    weightBudgetPerMin = Infinity,
   } = deps;
+  const spent = []; // [timestamp, weight] of recent radar requests
 
   const cache = { exchange: null, book: null, klines: new Map(), deriv: new Map() };
   const inflight = new Map();
@@ -94,6 +99,16 @@ export function createRadarScanner(deps) {
     for (;;) {
       try {
         await waitForWeightHeadroom(weight);
+        // self-imposed budget: wait until the last 60 s of radar traffic leaves room
+        for (;;) {
+          const t = now();
+          while (spent.length && t - spent[0][0] >= 60_000) spent.shift();
+          const used = spent.reduce((a, x) => a + x[1], 0);
+          if (used + weight <= weightBudgetPerMin || spent.length === 0) break;
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(Math.min(5000, Math.max(250, 60_000 - (t - spent[0][0]) + 50)));
+        }
+        spent.push([now(), weight]);
         stats.requests++;
         const res = await fapiFetch(url);
         if (res.status === 418 || res.status === 429) {

@@ -268,3 +268,18 @@ test("evaluate: end to end from cached klines, with a stale ticker flagged", asy
   const bad = sc.evaluate("TESTUSDT", { ticker: { lastPrice: "-1", priceChangePercent: "0", quoteVolume: "1" } });
   assert.equal(bad.status, "INSUFFICIENT DATA");
 });
+
+test("weight budget: radar never spends more than the budget in any rolling 60 s", async () => {
+  const net = fakeNet(async (url) => resp(klineRows(url.includes("interval=4h") ? "4h" : url.includes("interval=1h") ? "1h" : "15m")));
+  const t0 = clock;
+  const sleptMs = [];
+  const sleep = async (ms) => { sleptMs.push(ms); clock += ms; };
+  const sc = createRadarScanner({ fapiFetch: net.fapiFetch, now, sleep, concurrency: 1, weightBudgetPerMin: 20 });
+  await sc.scanKlines(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT"], { tfs: ["1h"] }); // 4 requests x weight 2 = 8
+  assert.equal(sleptMs.length, 0);
+  await sc.scanKlines(["EEEUSDT", "FFFUSDT", "GGGUSDT", "HHHUSDT", "IIIUSDT", "JJJUSDT"], { tfs: ["1h"] }); // 12 more -> 20 total, still allowed
+  assert.equal(sleptMs.length, 0);
+  await sc.scanKlines(["KKKUSDT"], { tfs: ["1h"] }); // would be 22 > 20 inside the same minute -> must wait
+  assert.ok(sleptMs.length > 0);
+  assert.ok(clock - t0 > 0);
+});
