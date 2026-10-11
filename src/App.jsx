@@ -1,6 +1,8 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback, Fragment } from "react";
 import { supabase, isBackgroundAlertsConfigured } from "./supabaseClient";
 import { analyzeCandles, MIN_ANALYSIS_CANDLES } from "./deepAnalysis";
+import { createRadarScanner, orderSymbols } from "./radarScanner";
+import { STATUS, DEFAULT_SETTINGS } from "./entryRadar";
 
 const DARK_THEME = {
   bg: "#0B0F14",
@@ -311,7 +313,7 @@ function getDeviceId() {
 }
 
 export default function FuturesTracker() {
-  const [tab, setTab] = useState("market"); // market | analyze | trades | screener | alerts
+  const [tab, setTab] = useState("market"); // market | analyze | trades | screener | radar | alerts
   const [themeMode, setThemeMode] = useState("dark");
   const [showSettings, setShowSettings] = useState(false);
   const [rows, setRows] = useState([]); // ticker rows
@@ -354,6 +356,8 @@ export default function FuturesTracker() {
   const [detailData, setDetailData] = useState({}); // symbol -> {changes:{min:pct}, ratios, updatedAt, loading}
   const [newAlertForm, setNewAlertForm] = useState({ symbol: "", min: 60, pct: 5, dir: "either" });
   const [analyzeSymbol, setAnalyzeSymbol] = useState(null);
+  const [analyzePrefill, setAnalyzePrefill] = useState(null); // symbol sent from Entry Radar
+  const openAnalyzeFromRadar = (sym) => { setAnalyzePrefill({ symbol: sym, n: Date.now() }); setTab("analyze"); };
   const [coinLogos, setCoinLogos] = useState({});
   const [savedTrades, setSavedTrades] = useState([]); // {id, symbol, entry, margin, leverage, dir, roiAlerts:[{id,pct}], pnlAlerts:[{id,value}]}
   const [athAtlMap, setAthAtlMap] = useState({}); // symbol -> {ath, athTime, atl, atlTime, ...} (1d)
@@ -1665,8 +1669,8 @@ export default function FuturesTracker() {
         )}
 
         {/* Tabs */}
-        <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${C.border}` }}>
-          {["market", "analyze", "trades", "screener", "alerts"].map((t) => (
+        <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${C.border}`, overflowX: "auto" }}>
+          {["market", "analyze", "trades", "screener", "radar", "alerts"].map((t) => (
             <div
               key={t}
               className="ft-tab"
@@ -1679,9 +1683,10 @@ export default function FuturesTracker() {
                 borderBottom: tab === t ? `2px solid ${C.amber}` : "2px solid transparent",
                 marginBottom: -1,
                 textTransform: "capitalize",
+                whiteSpace: "nowrap",
               }}
             >
-              {t === "alerts" && triggered.length > 0
+              {t === "radar" ? "Entry Radar" : t === "alerts" && triggered.length > 0
                 ? `Alerts · ${triggered.length}`
                 : t === "trades" && savedTrades.length > 0
                 ? `Trades · ${savedTrades.length}`
@@ -1858,7 +1863,12 @@ export default function FuturesTracker() {
             setSavedTrades={setSavedTrades}
             logos={coinLogos}
             goToTrades={() => setTab("trades")}
+            prefill={analyzePrefill}
           />
+        )}
+
+        {tab === "radar" && (
+          <EntryRadarTab rows={rows} funding={funding} logos={coinLogos} openAnalyze={openAnalyzeFromRadar} />
         )}
 
         {tab === "trades" && (
@@ -3025,7 +3035,664 @@ function TrackedTradeRow({ t, row, funding, logos, onRemove, onAddRoiAlert, onRe
   );
 }
 
-function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrades, setSavedTrades, logos, goToTrades }) {
+
+// =====================================================================
+// ENTRY RADAR — scans every eligible USDⓈ-M perpetual and ranks LONG /
+// SHORT setups. Analysis lives in entryRadar.js, data fetching in
+// radarScanner.js; this is only the screen. Scores are heuristic ranking
+// numbers, not win probabilities, and nothing here places a trade.
+// =====================================================================
+let radarScannerSingleton = null;
+function getRadarScanner() {
+  if (!radarScannerSingleton) {
+    radarScannerSingleton = createRadarScanner({
+      fapiFetch,
+      waitForWeightHeadroom,
+      blockedSecondsLeft: binanceBlockedSecondsLeft,
+    });
+  }
+  return radarScannerSingleton;
+}
+
+const RADAR_SCOPES = [
+  { key: "50", label: "Top 50 by volume", n: 50 },
+  { key: "100", label: "Top 100 by volume", n: 100 },
+  { key: "200", label: "Top 200 by volume", n: 200 },
+  { key: "all", label: "All eligible (slow)", n: Infinity },
+];
+const RADAR_DEFAULTS = {
+  scope: "100",
+  minScore: 55,
+  minVolume: 10_000_000,
+  statusFilter: "all",
+  trendFilter: "all",
+  structFilter: "all",
+  fiveMin: false,
+  autoRefresh: true,
+  feePct: 0.05,
+  slippagePct: 0.03,
+  alertsOn: false,
+  alertZone: true,
+  alertTrigger: true,
+  alertMinScore: 65,
+  alertCooldownMin: 60,
+};
+const RADAR_VOLUMES = [
+  [0, "Any volume"], [1e6, "≥ 1M"], [5e6, "≥ 5M"], [1e7, "≥ 10M"], [5e7, "≥ 50M"], [1e8, "≥ 100M"], [5e8, "≥ 500M"],
+];
+
+function radarStatusStyle(status) {
+  if (status === STATUS.LONG_TRIGGERED) return { color: "#0B1A12", bg: C.gain };
+  if (status === STATUS.SHORT_TRIGGERED) return { color: "#1D0B0B", bg: C.loss };
+  if (status === STATUS.LONG_WAIT) return { color: C.gain, bg: C.gainBg };
+  if (status === STATUS.SHORT_WAIT) return { color: C.loss, bg: C.lossBg };
+  if (status === STATUS.TOO_FAR) return { color: C.amber, bg: "rgba(245,166,35,0.12)" };
+  return { color: C.textDim, bg: "transparent" };
+}
+function radarAge(ms) {
+  if (ms === null || ms === undefined || !isFinite(ms)) return "—";
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return s + "s";
+  if (s < 5400) return Math.round(s / 60) + "m";
+  return Math.round(s / 3600) + "h";
+}
+
+function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
+  const scanner = getRadarScanner();
+  const [cfg, setCfg] = useState(RADAR_DEFAULTS);
+  const cfgLoaded = useRef(false);
+  const [eligible, setEligible] = useState([]);
+  const [infoState, setInfoState] = useState({ status: "idle", error: null, stale: false });
+  const [scan, setScan] = useState({ state: "idle", done: 0, total: 0, errors: 0, pausedSeconds: 0, phase: "" });
+  const [version, setVersion] = useState(0);
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState({ key: "score", dir: "desc" });
+  const [expanded, setExpanded] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showWait, setShowWait] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [notifPerm, setNotifPerm] = useState(typeof Notification !== "undefined" ? Notification.permission : "denied");
+  const [rowsAt, setRowsAt] = useState(Date.now());
+  const [tick, setTick] = useState(0);
+  const runId = useRef(0);
+  const bumpTimer = useRef(null);
+  const activeAlerts = useRef(new Set());
+  const alertLog = useRef({});
+  const prioRef = useRef([]);
+
+  // persisted settings
+  useEffect(() => {
+    (async () => {
+      const saved = await safeStorageGet("radar-settings");
+      if (saved) setCfg((c) => ({ ...c, ...saved }));
+      const log = await safeStorageGet("radar-alert-log");
+      if (log) alertLog.current = log;
+      cfgLoaded.current = true;
+    })();
+  }, []);
+  useEffect(() => {
+    if (cfgLoaded.current) safeStorageSet("radar-settings", cfg);
+  }, [cfg]);
+  const set = (k, v) => setCfg((c) => ({ ...c, [k]: v }));
+
+  // price freshness + periodic re-render so ages stay honest
+  useEffect(() => setRowsAt(Date.now()), [rows]);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  const tickerBySymbol = useMemo(() => {
+    const m = {};
+    rows.forEach((r) => (m[r.symbol] = r));
+    return m;
+  }, [rows]);
+
+  const bump = useCallback(() => {
+    if (bumpTimer.current) return;
+    bumpTimer.current = setTimeout(() => {
+      bumpTimer.current = null;
+      setVersion((v) => v + 1);
+    }, 300);
+  }, []);
+
+  const settings = useMemo(
+    () => ({ feePct: Number(cfg.feePct) || 0, slippagePct: Number(cfg.slippagePct) || 0, minScore: DEFAULT_SETTINGS.minScore, minQuoteVol: cfg.minVolume > 0 ? cfg.minVolume : DEFAULT_SETTINGS.minQuoteVol }),
+    [cfg.feePct, cfg.slippagePct, cfg.minVolume]
+  );
+
+  const runScan = useCallback(
+    async (opts = {}) => {
+      const id = ++runId.current;
+      const cancelled = () => runId.current !== id;
+      const quiet = !!opts.quiet;
+      if (!quiet) setScan({ state: "scanning", done: 0, total: 0, errors: 0, pausedSeconds: 0, phase: "Loading exchange info" });
+      let list = eligible;
+      try {
+        const info = await scanner.loadExchangeInfo();
+        list = info.symbols;
+        setEligible(list);
+        setInfoState({ status: "ready", error: null, stale: info.stale });
+      } catch (e) {
+        setInfoState({ status: "error", error: e.message || String(e), stale: false });
+        setScan((s) => ({ ...s, state: "error", phase: "" }));
+        return;
+      }
+      if (cancelled()) return;
+      scanner.loadBook().then(bump);
+      const scope = RADAR_SCOPES.find((s) => s.key === cfg.scope) || RADAR_SCOPES[1];
+      const withTicker = list.filter((s) => tickerBySymbol[s.symbol]);
+      const ordered = orderSymbols(withTicker, tickerBySymbol, prioRef.current).slice(0, scope.n);
+      const tfs = cfg.fiveMin ? ["4h", "1h", "15m", "5m"] : ["4h", "1h", "15m"];
+      const r1 = await scanner.scanKlines(ordered, {
+        tfs,
+        isCancelled: cancelled,
+        onProgress: (p) => !cancelled() && !quiet && setScan((s) => ({ ...s, state: p.state, done: p.done, total: p.total, errors: p.errors, pausedSeconds: p.pausedSeconds || 0, phase: "Scanning candles" })),
+        onSymbol: bump,
+      });
+      if (cancelled()) return;
+      bump();
+      // phase 2: open interest + long/short ratio only for the promising few
+      setScan((s) => ({ ...s, state: "scanning", phase: "Fetching OI / long-short for top candidates" }));
+      const prelim = ordered
+        .map((s) => scanner.evaluate(s.symbol, { ticker: tickerBySymbol[s.symbol], funding: funding[s.symbol], settings, tfs: ["4h", "1h", "15m"] }))
+        .filter((r) => r.side && Math.max(r.score.long, r.score.short) >= settings.minScore - 10)
+        .sort((a, b) => Math.max(b.score.long, b.score.short) - Math.max(a.score.long, a.score.short))
+        .slice(0, 40)
+        .map((r) => r.symbol);
+      await scanner.scanDeriv(prelim, { isCancelled: cancelled, onSymbol: bump });
+      if (cancelled()) return;
+      bump();
+      setScan((s) => ({ ...s, state: "done", total: r1.total, done: r1.done, errors: r1.errors, phase: "", at: Date.now() }));
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [scanner, cfg.scope, cfg.fiveMin, tickerBySymbol, funding, settings, bump, eligible]
+  );
+
+  // first visit: scan once rows exist. Leaving the tab cancels running work.
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (!startedRef.current && rows.length > 0) {
+      startedRef.current = true;
+      runScan();
+    }
+  }, [rows.length, runScan]);
+  useEffect(() => () => { runId.current++; }, []);
+  // gentle auto-refresh: cached candles make this cheap (only new candles are downloaded)
+  useEffect(() => {
+    if (!cfg.autoRefresh) return undefined;
+    const id = setInterval(() => {
+      if (scan.state !== "scanning" && scan.state !== "paused") runScan({ quiet: true });
+    }, 120000);
+    return () => clearInterval(id);
+  }, [cfg.autoRefresh, scan.state, runScan]);
+
+  // ---- results (re-evaluated cheaply from cached candles + live ticker) ----
+  const results = useMemo(() => {
+    const out = [];
+    const tAge = Date.now() - rowsAt;
+    eligible.forEach((s) => {
+      if (!scanner.hasKlines(s.symbol)) return;
+      const tk = tickerBySymbol[s.symbol];
+      if (!tk) return;
+      out.push({ ...scanner.evaluate(s.symbol, { ticker: tk, funding: funding[s.symbol], tickerAgeMs: tAge, settings }), base: s.base });
+    });
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eligible, rows, funding, version, settings, scanner, tick]);
+
+  // ---- alerts: zone entry / confirmed trigger, once per setup ID, with cooldown ----
+  useEffect(() => {
+    if (!cfg.alertsOn || results.length === 0) return;
+    const nowMs = Date.now();
+    const trueKeys = new Set();
+    results.forEach((r) => {
+      if (!r.best || !r.id || r.best.score < cfg.alertMinScore || r.provisional) return;
+      const inZone = r.price >= r.best.plan.zone.lo && r.price <= r.best.plan.zone.hi;
+      const wait = r.status === STATUS.LONG_WAIT || r.status === STATUS.SHORT_WAIT;
+      const trig = r.status === STATUS.LONG_TRIGGERED || r.status === STATUS.SHORT_TRIGGERED;
+      if (cfg.alertZone && wait && inZone) trueKeys.add(r.id + "|zone");
+      if (cfg.alertTrigger && trig) trueKeys.add(r.id + "|trigger");
+    });
+    activeAlerts.current.forEach((k) => !trueKeys.has(k) && activeAlerts.current.delete(k));
+    trueKeys.forEach((k) => {
+      if (activeAlerts.current.has(k)) return;
+      activeAlerts.current.add(k);
+      const last = alertLog.current[k] || 0;
+      if (nowMs - last < cfg.alertCooldownMin * 60000) return;
+      alertLog.current[k] = nowMs;
+      safeStorageSet("radar-alert-log", alertLog.current);
+      const [id, kind] = k.split("|");
+      const r = results.find((x) => x.id === id);
+      if (!r || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+      try {
+        new Notification(`${r.symbol.replace("USDT", "/USDT")} · ${kind === "zone" ? "price entered the entry zone" : r.status}`, {
+          body: `${r.best.side === 1 ? "LONG" : "SHORT"} setup score ${r.best.score}/100 · zone ${fmtPrice(r.best.plan.zone.lo)}–${fmtPrice(r.best.plan.zone.hi)} · stop ${fmtPrice(r.best.plan.stop)}. Heuristic ranking, not a trade signal.`,
+          tag: k,
+        });
+      } catch {
+        /* notifications unavailable */
+      }
+    });
+  }, [results, cfg.alertsOn, cfg.alertZone, cfg.alertTrigger, cfg.alertMinScore, cfg.alertCooldownMin]);
+
+  // ---- derived lists ----
+  const isLongRow = (r) => r.side === 1 && [STATUS.LONG_WAIT, STATUS.LONG_TRIGGERED, STATUS.TOO_FAR].includes(r.status);
+  const isShortRow = (r) => r.side === -1 && [STATUS.SHORT_WAIT, STATUS.SHORT_TRIGGERED, STATUS.TOO_FAR].includes(r.status);
+  const q = query.trim().toUpperCase();
+  const passes = (r) => {
+    if (q && !r.symbol.includes(q)) return false;
+    if (r.quoteVolume !== undefined && r.quoteVolume < cfg.minVolume) return false;
+    if (cfg.trendFilter !== "all" && r.t4 && r.t4.label !== cfg.trendFilter) return false;
+    if (cfg.structFilter !== "all" && r.structure1h !== cfg.structFilter) return false;
+    return true;
+  };
+  const passesSetup = (r) => {
+    if (!passes(r)) return false;
+    if (r.best && r.best.score < cfg.minScore) return false;
+    if (cfg.statusFilter === "triggered") return r.status === STATUS.LONG_TRIGGERED || r.status === STATUS.SHORT_TRIGGERED;
+    if (cfg.statusFilter === "setup") return r.status === STATUS.LONG_WAIT || r.status === STATUS.SHORT_WAIT;
+    if (cfg.statusFilter === "far") return r.status === STATUS.TOO_FAR;
+    return true;
+  };
+  const sortVal = (r, key) => {
+    switch (key) {
+      case "symbol": return r.symbol;
+      case "price": return r.price;
+      case "change": return r.change24h;
+      case "volume": return r.quoteVolume;
+      case "score": return r.best ? r.best.score : -1;
+      case "rr": return r.best ? r.best.plan.rr2 ?? -99 : -99;
+      case "oi": return r.deriv && r.deriv.oiChange1hPct !== null && r.deriv.oiChange1hPct !== undefined ? r.deriv.oiChange1hPct : -999;
+      case "funding": return r.funding ? r.funding.rate : -999;
+      default: return 0;
+    }
+  };
+  const sorter = (a, b) => {
+    const va = sortVal(a, sort.key), vb = sortVal(b, sort.key);
+    const c = typeof va === "string" ? va.localeCompare(vb) : va - vb;
+    return sort.dir === "asc" ? c : -c;
+  };
+  const longs = useMemo(() => results.filter((r) => isLongRow(r) && passesSetup(r)).sort(sorter), [results, q, cfg, sort]); // eslint-disable-line react-hooks/exhaustive-deps
+  const shorts = useMemo(() => results.filter((r) => isShortRow(r) && passesSetup(r)).sort(sorter), [results, q, cfg, sort]); // eslint-disable-line react-hooks/exhaustive-deps
+  const waits = useMemo(
+    () => results.filter((r) => !isLongRow(r) && !isShortRow(r) && passes(r)).sort((a, b) => Math.max(b.score.long, b.score.short) - Math.max(a.score.long, a.score.short)),
+    [results, q, cfg] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const counts = useMemo(() => {
+    const c = { long: 0, short: 0, wait: 0 };
+    results.forEach((r) => {
+      if (r.status === STATUS.LONG_WAIT || r.status === STATUS.LONG_TRIGGERED) c.long++;
+      else if (r.status === STATUS.SHORT_WAIT || r.status === STATUS.SHORT_TRIGGERED) c.short++;
+      else c.wait++;
+    });
+    return c;
+  }, [results]);
+  // remember what is on screen so the next scan refreshes those first
+  useEffect(() => {
+    prioRef.current = [expanded, ...longs.slice(0, 20).map((r) => r.symbol), ...shorts.slice(0, 20).map((r) => r.symbol)].filter(Boolean);
+  }, [longs, shorts, expanded]);
+
+  // lazily fetch derivatives for a symbol the user opens
+  const toggleExpand = (sym) => {
+    setExpanded((e) => (e === sym ? null : sym));
+    if (!scanner.hasDeriv(sym)) {
+      scanner.getDeriv(sym).then(bump).catch(() => {});
+    }
+  };
+
+  const th = (label, key, align = "right") => (
+    <th
+      onClick={key ? () => setSort((s) => ({ key, dir: s.key === key && s.dir === "desc" ? "asc" : "desc" })) : undefined}
+      className={key ? "ft-btn" : undefined}
+      style={{ textAlign: align, padding: "7px 8px", fontSize: 10, color: sort.key === key ? C.amber : C.textDim, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.03em", whiteSpace: "nowrap", borderBottom: `1px solid ${C.border}`, cursor: key ? "pointer" : "default" }}
+    >
+      {label}
+      {sort.key === key ? (sort.dir === "desc" ? " ↓" : " ↑") : ""}
+    </th>
+  );
+  const td = { padding: "8px", fontSize: 12, fontFamily: mono, textAlign: "right", whiteSpace: "nowrap", borderBottom: `1px solid ${C.border}` };
+
+  const Cell = ({ r, side }) => {
+    const p = r.best.plan;
+    const st = radarStatusStyle(r.status);
+    const oi = r.deriv && r.deriv.oiChange1hPct !== null && r.deriv.oiChange1hPct !== undefined ? r.deriv.oiChange1hPct : null;
+    const ageMs = r.freshness ? Math.max(r.ages["15m"] ?? 0, r.freshness.tickerAgeMs ?? 0) : null;
+    const klAt = r.freshness && r.freshness.klinesFetchedAt ? r.freshness.klinesFetchedAt["15m"] : null;
+    return (
+      <>
+        <td style={{ ...td, textAlign: "left" }}>
+          <span onClick={(e) => { e.stopPropagation(); openAnalyze(r.symbol); }} style={{ display: "inline-flex", alignItems: "center", gap: 7, color: C.text, fontWeight: 700, textDecoration: "underline", textDecorationColor: C.border, textUnderlineOffset: 3 }}>
+            <CoinIcon symbol={r.symbol} logos={logos} size={18} />
+            {r.symbol.replace("USDT", "")}
+          </span>
+        </td>
+        <td style={td}>{fmtPrice(r.price)}</td>
+        <td style={{ ...td, color: pctColor(r.change24h) }}>{fmtPct(r.change24h)}</td>
+        <td style={{ ...td, color: r.t4.dir === 1 ? C.gain : r.t4.dir === -1 ? C.loss : C.textMuted }}>{r.t4.label}</td>
+        <td style={{ ...td, color: r.structure1h === "BULLISH" ? C.gain : r.structure1h === "BEARISH" ? C.loss : C.textMuted }}>{r.structure1h}</td>
+        <td style={{ ...td, fontWeight: 800, color: r.best.score >= 70 ? C.gain : r.best.score >= 55 ? C.amber : C.textMuted }}>{r.best.score}</td>
+        <td style={td}>{fmtPrice(p.zone.lo)}–{fmtPrice(p.zone.hi)}</td>
+        <td style={{ ...td, color: C.loss }}>{fmtPrice(p.stop)}</td>
+        <td style={{ ...td, color: C.gain }}>{p.targets.map((t) => fmtPrice(t.price)).join(" / ")}</td>
+        <td style={td}>{p.rr2 !== null && p.rr2 !== undefined ? p.rr2.toFixed(2) : "—"}</td>
+        <td style={{ ...td, color: oi === null ? C.textDim : pctColor(oi), fontSize: oi === null ? 9.5 : 12 }}>{oi === null ? "UNAVAILABLE" : fmtPct(oi)}</td>
+        <td style={{ ...td, color: r.funding ? pctColor(r.funding.rate) : C.textDim, fontSize: r.funding ? 12 : 9.5 }}>{r.funding ? (r.funding.rate * 100).toFixed(4) + "%" : "UNAVAILABLE"}</td>
+        <td style={{ ...td, fontSize: 11, color: r.stale ? C.amber : C.textDim }}>
+          {klAt ? radarAge(Date.now() - klAt) : "—"}
+          {r.stale ? " STALE" : ""}
+          {ageMs === null ? "" : ""}
+        </td>
+        <td style={{ ...td, textAlign: "left", whiteSpace: "normal", minWidth: 150 }}>
+          <span style={{ display: "inline-block", padding: "3px 7px", borderRadius: 6, fontSize: 10.5, fontWeight: 800, color: st.color, background: st.bg, fontFamily: sans }}>
+            {r.status}
+          </span>
+          {r.hint && <div style={{ fontSize: 10, color: C.amber, marginTop: 3, fontFamily: sans }}>{r.hint}</div>}
+          {r.provisional && <div style={{ fontSize: 10, color: C.amber, marginTop: 3, fontFamily: sans }}>PROVISIONAL — live candle not closed</div>}
+          {r.flags.filter((f) => f !== "OI/L-S UNAVAILABLE" && f !== "EMA200 UNAVAILABLE").map((f) => (
+            <span key={f} style={{ display: "inline-block", marginTop: 3, marginRight: 4, fontSize: 9, color: C.amber, border: `1px solid ${C.amber}`, borderRadius: 4, padding: "0 4px", fontFamily: sans }}>{f}</span>
+          ))}
+        </td>
+      </>
+    );
+  };
+
+  const Detail = ({ r, colSpan }) => {
+    const b = r.best;
+    const p = b.plan;
+    const side = b.side === 1 ? "long" : "short";
+    const det = r.detail[side];
+    const d = r.deriv;
+    const box = { background: C.bg, borderRadius: 8, padding: "10px 12px" };
+    const lab = { fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6, fontWeight: 700 };
+    const line = { fontSize: 11.5, color: C.textMuted, lineHeight: 1.55 };
+    return (
+      <tr>
+        <td colSpan={colSpan} style={{ padding: "4px 8px 14px", borderBottom: `1px solid ${C.border}`, background: C.panel }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 10, fontFamily: sans }}>
+            <div style={box}>
+              <div style={lab}>Entry plan <span style={{ color: C.textDim, fontWeight: 400 }}>(DERIVED from 1H structure + ATR)</span></div>
+              <div style={line}>Zone: <b style={{ color: C.text }}>{fmtPrice(p.zone.lo)} – {fmtPrice(p.zone.hi)}</b> ({p.zone.type})</div>
+              <div style={line}>Preferred entry: <b style={{ color: C.text }}>{fmtPrice(p.entry)}</b></div>
+              <div style={line}>Trigger: {p.trigger ? <>{p.trigger.text}. {p.trigger.closedConfirm ? <b style={{ color: C.gain }}>Confirmed on a closed candle.</b> : "Not confirmed yet."}</> : "UNAVAILABLE"}</div>
+              <div style={line}>Invalidation: <b style={{ color: C.text }}>{fmtPrice(p.invalidation)}</b> · Stop: <b style={{ color: C.loss }}>{fmtPrice(p.stop)}</b> ({p.riskPct !== null ? p.riskPct.toFixed(2) + "% risk" : "—"})</div>
+              {p.targets.map((t) => (
+                <div key={t.label} style={line}>{t.label}: <b style={{ color: C.gain }}>{fmtPrice(t.price)}</b> · R:R {t.rr !== null && t.rr !== undefined ? t.rr.toFixed(2) : "—"} <span style={{ color: C.textDim }}>({t.source})</span></div>
+              ))}
+              <div style={{ ...line, color: C.textDim }}>R:R is net of an assumed {(p.costPct ?? 0).toFixed(2)}% round-trip fees + slippage (configurable). Entry is a plan, not a guarantee of a fill.</div>
+              {p.issues.length > 0 && <div style={{ ...line, color: C.amber }}>{p.issues.join(" · ")}</div>}
+              {r.fine && <div style={line}>5m fine timing: {r.fine.text} ({r.fine.aligned ? "aligned" : "not aligned"})</div>}
+            </div>
+            <div style={box}>
+              <div style={lab}>Why this score — {b.score}/100 <span style={{ color: C.textDim, fontWeight: 400 }}>(ranking, not a win probability)</span></div>
+              {det.components.map((c) => (
+                <div key={c.key} style={{ ...line, display: "flex", justifyContent: "space-between", gap: 8 }}>
+                  <span>{c.name}<span style={{ color: C.textDim }}> — {c.note}</span></span>
+                  <span style={{ fontFamily: mono, color: c.unavailable ? C.amber : C.text, whiteSpace: "nowrap" }}>{c.points}/{c.weight}{c.derived ? " DERIVED" : ""}</span>
+                </div>
+              ))}
+              {det.penalties.map((x) => (
+                <div key={x.name} style={{ ...line, display: "flex", justifyContent: "space-between", gap: 8, color: C.loss }}>
+                  <span>{x.name}<span style={{ color: C.textDim }}> — {x.note}</span></span>
+                  <span style={{ fontFamily: mono }}>−{x.points}</span>
+                </div>
+              ))}
+              <div style={{ ...line, color: C.textDim }}>LONG {r.score.long} · SHORT {r.score.short}</div>
+            </div>
+            <div style={box}>
+              <div style={lab}>Context & data quality</div>
+              <div style={line}>Status reason: {r.reason}</div>
+              <div style={line}>4H: {r.t4.label} (strength {r.t4.strength}) — {r.t4.notes.join("; ")}</div>
+              <div style={line}>OI change 1h / 4h / 24h <span style={{ color: C.textDim }}>(DERIVED from Binance OI history)</span>: {d && d.oiChange1hPct != null ? `${fmtPct(d.oiChange1hPct)} / ${d.oiChange4hPct != null ? fmtPct(d.oiChange4hPct) : "UNAVAILABLE"} / ${d.oiChange24hPct != null ? fmtPct(d.oiChange24hPct) : "UNAVAILABLE"}` : "UNAVAILABLE"}</div>
+              <div style={line}>Long/short accounts <span style={{ color: C.textDim }}>(official ratio — context only, NOT position size)</span>: {d && d.longPct != null ? `${d.longPct.toFixed(0)}% long / ${d.shortPct.toFixed(0)}% short` : "UNAVAILABLE"}</div>
+              <div style={line}>Funding: {r.funding ? (r.funding.rate * 100).toFixed(4) + "%" : "UNAVAILABLE"} · Spread: {r.spreadPct !== null && r.spreadPct !== undefined ? r.spreadPct.toFixed(3) + "%" : "UNAVAILABLE"} · 24h volume: {fmtVol(r.quoteVolume)} USDT</div>
+              <div style={line}>Price/OI combinations are possibilities (e.g. price↑ + OI↑ may be new longs, or may not), never proof of who is trading.</div>
+              <div style={line}>Data age — candles fetched: 4H {radarAge(r.freshness?.klinesFetchedAt?.["4h"] ? Date.now() - r.freshness.klinesFetchedAt["4h"] : null)}, 1H {radarAge(r.freshness?.klinesFetchedAt?.["1h"] ? Date.now() - r.freshness.klinesFetchedAt["1h"] : null)}, 15m {radarAge(r.freshness?.klinesFetchedAt?.["15m"] ? Date.now() - r.freshness.klinesFetchedAt["15m"] : null)} · price {radarAge(r.freshness?.tickerAgeMs)} ago · OI/L-S {d && r.freshness?.derivFetchedAt ? radarAge(Date.now() - r.freshness.derivFetchedAt) + " ago" : "UNAVAILABLE"}</div>
+              {r.flags.includes("EMA200 UNAVAILABLE") && <div style={{ ...line, color: C.amber }}>EMA200 UNAVAILABLE — fewer than 200 closed 4H candles (newer listing); EMA20/50 and structure are used.</div>}
+              <div style={{ ...line, color: C.textDim }}>Setup ID: {r.id}</div>
+              <div style={{ marginTop: 8 }}>
+                <button onClick={() => openAnalyze(r.symbol)} className="ft-btn" style={{ background: C.amber, color: "#1A1300", border: "none", borderRadius: 6, padding: "7px 12px", fontSize: 12, fontWeight: 700 }}>
+                  Open in Analyze
+                </button>
+              </div>
+            </div>
+          </div>
+        </td>
+      </tr>
+    );
+  };
+
+  const COLS = 14;
+  const Table = ({ title, color, list, empty }) => (
+    <Card title={`${title} · ${list.length}`} style={{ padding: 0, overflow: "hidden" }}>
+      {list.length === 0 ? (
+        <div style={{ padding: "16px", fontSize: 12.5, color: C.textMuted }}>{empty}</div>
+      ) : (
+        <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+          <table style={{ borderCollapse: "collapse", minWidth: 1180, width: "100%" }}>
+            <thead>
+              <tr>
+                {th("Symbol", "symbol", "left")}
+                {th("Price", "price")}
+                {th("24h", "change")}
+                {th("4H trend")}
+                {th("1H structure")}
+                {th("Score", "score")}
+                {th("Entry zone")}
+                {th("Stop")}
+                {th("TP1 / TP2 / TP3")}
+                {th("R:R (TP2)", "rr")}
+                {th("OI Δ1h (derived)", "oi")}
+                {th("Funding", "funding")}
+                {th("Data age")}
+                {th("Status", null, "left")}
+              </tr>
+            </thead>
+            <tbody>
+              {list.map((r) => (
+                <Fragment key={r.symbol}>
+                  <tr onClick={() => toggleExpand(r.symbol)} className="ft-btn" style={{ cursor: "pointer", background: expanded === r.symbol ? C.bg : "transparent" }}>
+                    <Cell r={r} side={color} />
+                  </tr>
+                  {expanded === r.symbol && <Detail r={r} colSpan={COLS} />}
+                </Fragment>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+
+  const pct = scan.total ? Math.round((scan.done / scan.total) * 100) : 0;
+  const scanning = scan.state === "scanning" || scan.state === "paused";
+  const noData = results.length === 0;
+  const inputStyle = { ...selStyle(), padding: "8px 10px", fontSize: 12.5 };
+
+  return (
+    <>
+      {/* summary */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10, marginBottom: 14 }}>
+        {[
+          ["Eligible pairs", eligible.length || "—", C.text, "USDT · PERPETUAL · TRADING"],
+          ["Scanned", results.length, C.teal, `of ${RADAR_SCOPES.find((s) => s.key === cfg.scope)?.n === Infinity ? "all" : "top " + RADAR_SCOPES.find((s) => s.key === cfg.scope)?.n}`],
+          ["LONG setups", counts.long, C.gain, "waiting or triggered"],
+          ["SHORT setups", counts.short, C.loss, "waiting or triggered"],
+          ["WAIT / NO TRADE", counts.wait, C.amber, "too far, conflicting, no data"],
+        ].map(([label, value, color, sub]) => (
+          <div key={label} style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 14px", boxShadow: C.shadow }}>
+            <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 3 }}>{label}</div>
+            <div style={{ fontFamily: mono, fontWeight: 800, fontSize: 22, color }}>{value}</div>
+            <div style={{ fontSize: 9.5, color: C.textDim, marginTop: 2 }}>{sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* controls */}
+      <Card
+        title="Entry Radar"
+        right={
+          <button onClick={() => runScan()} disabled={scanning} className="ft-btn" style={{ background: C.amber, color: "#1A1300", border: "none", borderRadius: 6, padding: "7px 12px", fontSize: 12, fontWeight: 700, opacity: scanning ? 0.6 : 1 }}>
+            {scanning ? "Scanning…" : "Scan now"}
+          </button>
+        }
+      >
+        <div style={{ fontSize: 11.5, color: C.textMuted, lineHeight: 1.5, marginBottom: 12 }}>
+          Ranks possible LONG and SHORT setups using 4H trend, 1H structure and 15m confirmation on <b>closed candles</b>. Scores are heuristic rankings — not win probabilities, not advice, and nothing is traded for you.
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+          <input className="ft-input" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search symbol…" style={{ ...inputStyle, flex: "1 1 130px", minWidth: 110 }} />
+          <select value={cfg.scope} onChange={(e) => set("scope", e.target.value)} style={inputStyle}>
+            {RADAR_SCOPES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+          <select value={cfg.minVolume} onChange={(e) => set("minVolume", Number(e.target.value))} style={inputStyle}>
+            {RADAR_VOLUMES.map(([v, l]) => <option key={v} value={v}>24h vol {l}</option>)}
+          </select>
+          <select value={cfg.statusFilter} onChange={(e) => set("statusFilter", e.target.value)} style={inputStyle}>
+            <option value="all">All statuses</option>
+            <option value="triggered">Triggered only</option>
+            <option value="setup">Waiting for entry</option>
+            <option value="far">Price too far</option>
+          </select>
+          <select value={cfg.trendFilter} onChange={(e) => set("trendFilter", e.target.value)} style={inputStyle}>
+            <option value="all">4H: any</option>
+            <option value="UP">4H: up</option>
+            <option value="DOWN">4H: down</option>
+            <option value="RANGE">4H: range</option>
+          </select>
+          <select value={cfg.structFilter} onChange={(e) => set("structFilter", e.target.value)} style={inputStyle}>
+            <option value="all">1H: any</option>
+            <option value="BULLISH">1H: bullish</option>
+            <option value="BEARISH">1H: bearish</option>
+            <option value="RANGE">1H: range</option>
+          </select>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textMuted }}>
+            Min score
+            <input type="number" min="0" max="100" value={cfg.minScore} onChange={(e) => set("minScore", Math.max(0, Math.min(100, Number(e.target.value) || 0)))} style={{ ...inputStyle, width: 64 }} />
+          </label>
+        </div>
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 12, color: C.textMuted }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input type="checkbox" checked={cfg.fiveMin} onChange={(e) => set("fiveMin", e.target.checked)} /> include 5m fine-entry timing
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input type="checkbox" checked={cfg.autoRefresh} onChange={(e) => set("autoRefresh", e.target.checked)} /> auto-refresh every 2 min
+          </label>
+          <span onClick={() => setShowSettings((v) => !v)} className="ft-btn" style={{ color: C.textMuted }}>{showSettings ? "▾" : "▸"} Costs & alerts</span>
+          <span onClick={() => setShowHelp((v) => !v)} className="ft-btn" style={{ color: C.textMuted }}>{showHelp ? "▾" : "▸"} How it works</span>
+        </div>
+
+        {showSettings && (
+          <div style={{ marginTop: 12, borderTop: `1px solid ${C.border}`, paddingTop: 12, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 6, textTransform: "uppercase" }}>Cost assumptions (per side)</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <label style={{ fontSize: 11.5, color: C.textMuted }}>Fee %<input type="number" step="0.01" min="0" value={cfg.feePct} onChange={(e) => set("feePct", e.target.value)} style={{ ...inputStyle, width: "100%", display: "block", marginTop: 4 }} /></label>
+                <label style={{ fontSize: 11.5, color: C.textMuted }}>Slippage %<input type="number" step="0.01" min="0" value={cfg.slippagePct} onChange={(e) => set("slippagePct", e.target.value)} style={{ ...inputStyle, width: "100%", display: "block", marginTop: 4 }} /></label>
+              </div>
+              <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 6 }}>Applied to entry and exit when computing net reward:risk. Defaults are an assumption, not your actual fee tier.</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 6, textTransform: "uppercase" }}>Alerts (only while this app is open)</div>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textMuted, marginBottom: 5 }}>
+                <input type="checkbox" checked={cfg.alertsOn} onChange={(e) => { set("alertsOn", e.target.checked); if (e.target.checked && typeof Notification !== "undefined" && Notification.permission === "default") Notification.requestPermission().then(setNotifPerm); }} /> Enable Entry Radar alerts
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textMuted, marginBottom: 5 }}><input type="checkbox" checked={cfg.alertZone} onChange={(e) => set("alertZone", e.target.checked)} /> price enters the entry zone</label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textMuted, marginBottom: 8 }}><input type="checkbox" checked={cfg.alertTrigger} onChange={(e) => set("alertTrigger", e.target.checked)} /> confirmation met (closed candle)</label>
+              <div style={{ display: "flex", gap: 8 }}>
+                <label style={{ fontSize: 11.5, color: C.textMuted }}>Min score<input type="number" min="0" max="100" value={cfg.alertMinScore} onChange={(e) => set("alertMinScore", Number(e.target.value) || 0)} style={{ ...inputStyle, width: "100%", display: "block", marginTop: 4 }} /></label>
+                <label style={{ fontSize: 11.5, color: C.textMuted }}>Cooldown (min)<input type="number" min="1" value={cfg.alertCooldownMin} onChange={(e) => set("alertCooldownMin", Math.max(1, Number(e.target.value) || 60))} style={{ ...inputStyle, width: "100%", display: "block", marginTop: 4 }} /></label>
+              </div>
+              <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 6 }}>
+                One alert per setup ID and event, then the cooldown. Browser notifications: {notifPerm === "granted" ? "allowed" : notifPerm === "denied" ? "blocked in your browser settings" : "not yet allowed"}. Alerts do not run in the background and never place trades.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showHelp && (
+          <div style={{ marginTop: 12, borderTop: `1px solid ${C.border}`, paddingTop: 10, fontSize: 11, color: C.textDim, lineHeight: 1.55 }}>
+            <div style={{ marginBottom: 6 }}><b style={{ color: C.textMuted }}>Data</b> — official public Binance USDⓈ-M endpoints only (exchangeInfo, klines, 24h ticker, premium index/funding, bookTicker, open-interest history, global long/short account ratio). No API key. Pairs come from exchangeInfo (USDT · PERPETUAL · TRADING) — never a fixed list.</div>
+            <div style={{ marginBottom: 6 }}><b style={{ color: C.textMuted }}>Timeframes</b> — 4H trend, 1H setup, 15m confirmation, optional 5m timing. Indicators and swings use closed candles only; the live candle is only used for a clearly marked PROVISIONAL read.</div>
+            <div style={{ marginBottom: 6 }}><b style={{ color: C.textMuted }}>Score</b> (LONG and SHORT separately) — 4H trend alignment 25 · 1H structure & location 20 · 15m confirmation 15 · reward:risk 15 · momentum health 10 · volume 5 · OI/funding/long-short context 10, then penalties for conflicting timeframes, poor liquidity, wide spread, stale data, nearby opposing level, high volatility and poor reward:risk. Correlated indicators are counted once.</div>
+            <div style={{ marginBottom: 6 }}><b style={{ color: C.textMuted }}>Plan</b> — entry zone from the 1H EMA20/50 pullback, a support/resistance zone or a breakout retest; stop beyond the swing invalidation plus a 0.25 ATR buffer; targets from the next structure levels, falling back to ATR multiples; R:R is net of fees and slippage.</div>
+            <div style={{ marginBottom: 6 }}><b style={{ color: C.textMuted }}>Statuses</b> — TRIGGERED needs a closed 15m confirmation while price is still near the zone; price more than {DEFAULT_SETTINGS.maxChaseAtr} × 1H ATR beyond the zone is WAIT—PRICE TOO FAR (pullback or retest); a score under {DEFAULT_SETTINGS.minScore}, a 4H trend against the side, or both sides scoring within {DEFAULT_SETTINGS.conflictMargin} points is NO TRADE; missing/short/stale data is INSUFFICIENT DATA.</div>
+            <div><b style={{ color: C.textMuted }}>Limits</b> — OI and long/short ratio are contextual, not actual whale or position data, and are fetched only for the strongest candidates (UNAVAILABLE elsewhere). Scanning all pairs is slow because requests are rate-limited on purpose.</div>
+          </div>
+        )}
+      </Card>
+
+      {/* scan state */}
+      {scanning && (
+        <div style={{ fontSize: 11.5, color: C.textMuted, marginBottom: 12, fontFamily: mono, display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ flex: 1, height: 3, background: C.border, borderRadius: 2, overflow: "hidden" }}>
+            <div style={{ width: `${pct}%`, height: "100%", background: C.amber, transition: "width .2s" }} />
+          </div>
+          {scan.state === "paused" ? `Binance rate limit — paused ~${scan.pausedSeconds}s` : `${scan.phase || "Scanning"} (${scan.done}/${scan.total || "…"})`}
+        </div>
+      )}
+      {infoState.status === "error" && (
+        <div style={{ background: C.panel, border: `1px solid ${C.loss}`, borderRadius: 8, padding: "11px 13px", fontSize: 13, color: C.loss, marginBottom: 12 }}>
+          Couldn't load the list of Binance futures contracts ({infoState.error}).{" "}
+          <span onClick={() => runScan()} className="ft-btn" style={{ textDecoration: "underline" }}>Try again</span>
+        </div>
+      )}
+      {infoState.stale && <div style={{ fontSize: 11.5, color: C.amber, marginBottom: 10 }}>Using a cached contract list — Binance exchange info couldn't be refreshed.</div>}
+      {scan.errors > 0 && scan.state === "done" && (
+        <div style={{ fontSize: 11.5, color: C.amber, marginBottom: 10 }}>{scan.errors} symbol{scan.errors === 1 ? "" : "s"} couldn't be loaded this scan (marked INSUFFICIENT DATA or skipped). Others are unaffected.</div>
+      )}
+      {scan.state === "done" && scan.at && <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 10 }}>Last full scan {radarAge(Date.now() - scan.at)} ago · results re-evaluate with live prices every few seconds.</div>}
+
+      {rows.length === 0 ? (
+        <Card><div style={{ fontSize: 12.5, color: C.textMuted }}>Waiting for live prices from Binance…</div></Card>
+      ) : noData && scanning ? (
+        <Card><div style={{ fontSize: 12.5, color: C.textMuted }}>Scanning candles — first results appear in a few seconds…</div></Card>
+      ) : noData ? (
+        <Card><div style={{ fontSize: 12.5, color: C.textMuted }}>No results yet. Press “Scan now”.</div></Card>
+      ) : (
+        <>
+          <Table title="LONG OPPORTUNITIES" list={longs} empty="No LONG setups match the current filters. That is a valid answer — the radar does not force trades." />
+          <Table title="SHORT OPPORTUNITIES" list={shorts} empty="No SHORT setups match the current filters. That is a valid answer — the radar does not force trades." />
+          <Card title={`WAIT / NO TRADE / INSUFFICIENT DATA · ${waits.length}`} style={{ padding: 0, overflow: "hidden" }} right={<span onClick={() => setShowWait((v) => !v)} className="ft-btn" style={{ fontSize: 11, color: C.textMuted, padding: "12px 16px 0 0" }}>{showWait ? "Hide" : "Show"}</span>}>
+            {showWait && (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ borderCollapse: "collapse", minWidth: 760, width: "100%" }}>
+                  <thead>
+                    <tr>
+                      {th("Symbol", "symbol", "left")}
+                      {th("Price", "price")}
+                      {th("24h", "change")}
+                      {th("LONG / SHORT")}
+                      {th("Status", null, "left")}
+                      {th("Why", null, "left")}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {waits.slice(0, 200).map((r) => (
+                      <tr key={r.symbol} onClick={() => openAnalyze(r.symbol)} className="ft-btn" style={{ cursor: "pointer" }}>
+                        <td style={{ ...td, textAlign: "left", fontWeight: 700 }}>{r.symbol.replace("USDT", "")}</td>
+                        <td style={td}>{r.price ? fmtPrice(r.price) : "—"}</td>
+                        <td style={{ ...td, color: pctColor(r.change24h) }}>{r.change24h !== undefined ? fmtPct(r.change24h) : "—"}</td>
+                        <td style={td}>{r.score.long} / {r.score.short}</td>
+                        <td style={{ ...td, textAlign: "left", fontSize: 11, color: radarStatusStyle(r.status).color, fontFamily: sans, fontWeight: 700 }}>{r.status}{r.hint ? ` · ${r.hint}` : ""}</td>
+                        <td style={{ ...td, textAlign: "left", whiteSpace: "normal", fontSize: 11, color: C.textDim, fontFamily: sans }}>{r.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        </>
+      )}
+      <div style={{ fontSize: 10.5, color: C.textDim, lineHeight: 1.5, marginBottom: 20 }}>
+        Not financial advice. Entry zones, stops and targets are derived from market structure and ATR and may not fill or hold; fees and slippage vary. Trading futures with leverage can lose more than you expect.
+      </div>
+    </>
+  );
+}
+
+function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrades, setSavedTrades, logos, goToTrades, prefill }) {
   const [section, setSection] = useState("setup"); // setup | deep
   const [justTracked, setJustTracked] = useState(null); // symbol just added to Trades
   const [form, setForm] = useState({ symbol: "", entry: "", margin: "", leverage: 10, dir: "long" });
@@ -3040,6 +3707,11 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
   const [ta, setTa] = useState(null);
   const [taStatus, setTaStatus] = useState("idle"); // idle | loading | live | error
   const [showHelp, setShowHelp] = useState(false);
+
+  // Symbol sent from Entry Radar
+  useEffect(() => {
+    if (prefill?.symbol) setForm((f) => ({ ...f, symbol: prefill.symbol.replace(/USDT$/, "") }));
+  }, [prefill?.n]);
 
   const matchedRow = useMemo(() => {
     const sym = form.symbol.trim().toUpperCase();
