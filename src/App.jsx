@@ -5658,9 +5658,9 @@ function ScreenerPanel({
               <th style={{ padding: "6px 8px" }}>Trend</th>
               <th style={{ padding: "6px 8px" }}>Strength</th>
               <th style={{ padding: "6px 8px" }}>Momentum</th>
+              <th style={{ padding: "6px 8px" }}>Reversal</th>
               <th style={{ padding: "6px 8px" }}>Support</th>
               <th style={{ padding: "6px 8px" }}>Resistance</th>
-              <th style={{ padding: "6px 8px" }}>Reversal</th>
               <th style={{ padding: "6px 8px" }}>ATL</th>
               <th style={{ padding: "6px 8px" }}>ATH</th>
             </tr>
@@ -5706,6 +5706,9 @@ function ScreenerPanel({
                           </span>
                         )}
                       </td>
+                      <td style={{ padding: "8px 8px" }}>
+                        <TaBadge text={t.reversal} tone={reversalTone(t.reversal)} />
+                      </td>
                       <td style={{ padding: "8px 8px", fontFamily: mono, color: C.gain }}>
                         {t.support != null ? t.support.toPrecision(6) : "—"}
                         {t.nearSupportPct != null && (
@@ -5721,9 +5724,6 @@ function ScreenerPanel({
                             ({t.nearResistancePct.toFixed(1)}%)
                           </span>
                         )}
-                      </td>
-                      <td style={{ padding: "8px 8px" }}>
-                        <TaBadge text={t.reversal} tone={reversalTone(t.reversal)} />
                       </td>
                     </>
                   )}
