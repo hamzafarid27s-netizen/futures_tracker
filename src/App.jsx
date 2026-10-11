@@ -3375,7 +3375,9 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
         <td style={{ ...td, fontWeight: 800, color: r.best.score >= 70 ? C.gain : r.best.score >= 55 ? C.amber : C.textMuted }}>{r.best.score}</td>
         <td style={td}>{fmtPrice(p.zone.lo)}–{fmtPrice(p.zone.hi)}</td>
         <td style={{ ...td, color: C.loss }}>{fmtPrice(p.stop)}</td>
-        <td style={{ ...td, color: C.gain }}>{p.targets.map((t) => fmtPrice(t.price)).join(" / ")}</td>
+        {[0, 1, 2].map((i) => (
+          <td key={i} style={{ ...td, color: C.gain }}>{p.targets[i] ? fmtPrice(p.targets[i].price) : "—"}</td>
+        ))}
         <td style={td}>{p.rr2 !== null && p.rr2 !== undefined ? p.rr2.toFixed(2) : "—"}</td>
         <td style={{ ...td, color: oi === null ? C.textDim : pctColor(oi), fontSize: oi === null ? 9.5 : 12 }}>{oi === null ? "UNAVAILABLE" : fmtPct(oi)}</td>
         <td style={{ ...td, color: r.funding ? pctColor(r.funding.rate) : C.textDim, fontSize: r.funding ? 12 : 9.5 }}>{r.funding ? (r.funding.rate * 100).toFixed(4) + "%" : "UNAVAILABLE"}</td>
@@ -3463,7 +3465,7 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
     );
   };
 
-  const COLS = 14;
+  const COLS = 16;
   // plain function (not a component): a component defined here would be re-created on every
   // render, which rebuilt the table DOM and reset its horizontal scroll to the first column
   const renderTable = ({ title, color, list, empty }) => (
@@ -3472,7 +3474,7 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
         <div style={{ padding: "16px", fontSize: 12.5, color: C.textMuted }}>{empty}</div>
       ) : (
         <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
-          <table style={{ borderCollapse: "collapse", minWidth: 1180, width: "100%" }}>
+          <table style={{ borderCollapse: "collapse", minWidth: 1260, width: "100%" }}>
             <thead>
               <tr>
                 {th("Symbol", "symbol", "left")}
@@ -3483,7 +3485,9 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
                 {th("Score", "score")}
                 {th("Entry zone")}
                 {th("Stop")}
-                {th("TP1 / TP2 / TP3")}
+                {th("TP1")}
+                {th("TP2")}
+                {th("TP3")}
                 {th("R:R (TP2)", "rr")}
                 {th("OI Δ1h (derived)", "oi")}
                 {th("Funding", "funding")}
