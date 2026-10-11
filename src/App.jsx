@@ -3115,6 +3115,12 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
   const [notifPerm, setNotifPerm] = useState(typeof Notification !== "undefined" ? Notification.permission : "denied");
   const [rowsAt, setRowsAt] = useState(Date.now());
   const [tick, setTick] = useState(0);
+  const [narrow, setNarrow] = useState(typeof window !== "undefined" && window.innerWidth < 820);
+  useEffect(() => {
+    const on = () => setNarrow(window.innerWidth < 820);
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, []);
   const runId = useRef(0);
   const bumpTimer = useRef(null);
   const activeAlerts = useRef(new Set());
@@ -3400,7 +3406,7 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
     );
   };
 
-  const Detail = ({ r, colSpan }) => {
+  const Detail = ({ r, colSpan, bare }) => {
     const b = r.best;
     const p = b.plan;
     const side = b.side === 1 ? "long" : "short";
@@ -3409,9 +3415,7 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
     const box = { background: C.bg, borderRadius: 8, padding: "10px 12px" };
     const lab = { fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6, fontWeight: 700 };
     const line = { fontSize: 11.5, color: C.textMuted, lineHeight: 1.55 };
-    return (
-      <tr>
-        <td colSpan={colSpan} style={{ padding: "4px 8px 14px", borderBottom: `1px solid ${C.border}`, background: C.panel }}>
+    const body = (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 10, fontFamily: sans }}>
             <div style={box}>
               <div style={lab}>Entry plan <span style={{ color: C.textDim, fontWeight: 400 }}>(DERIVED from 1H structure + ATR)</span></div>
@@ -3460,9 +3464,76 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
               </div>
             </div>
           </div>
+    );
+    if (bare) return <div style={{ padding: "4px 12px 14px", background: C.panel }}>{body}</div>;
+    return (
+      <tr>
+        <td colSpan={colSpan} style={{ padding: "4px 8px 14px", borderBottom: `1px solid ${C.border}`, background: C.panel }}>
+          {body}
         </td>
       </tr>
     );
+  };
+
+  // Phone layout: one card per setup, every figure visible without sideways scrolling
+  const renderCards = ({ list, empty }) => {
+    if (list.length === 0) return <div style={{ padding: "16px", fontSize: 12.5, color: C.textMuted }}>{empty}</div>;
+    const lab = { fontSize: 9.5, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", fontWeight: 700, marginBottom: 2 };
+    const val = { fontSize: 12.5, fontFamily: mono, color: C.text };
+    const F = ({ k, children, color, span }) => (
+      <div style={{ gridColumn: span ? `span ${span}` : undefined }}>
+        <div style={lab}>{k}</div>
+        <div style={{ ...val, color: color || C.text }}>{children}</div>
+      </div>
+    );
+    return list.map((r) => {
+      const p = r.best.plan;
+      const st = radarStatusStyle(r.status);
+      const oi = r.deriv && r.deriv.oiChange1hPct !== null && r.deriv.oiChange1hPct !== undefined ? r.deriv.oiChange1hPct : null;
+      const klAt = r.freshness && r.freshness.klinesFetchedAt ? r.freshness.klinesFetchedAt["15m"] : null;
+      const tr4 = r.t4.dir === 1 ? C.gain : r.t4.dir === -1 ? C.loss : C.textMuted;
+      const s1 = r.structure1h === "BULLISH" ? C.gain : r.structure1h === "BEARISH" ? C.loss : C.textMuted;
+      return (
+        <div key={r.symbol} style={{ borderTop: `1px solid ${C.border}`, background: expanded === r.symbol ? C.bg : "transparent" }}>
+          <div onClick={() => toggleExpand(r.symbol)} className="ft-btn" style={{ padding: "12px 14px", cursor: "pointer" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
+              <span onClick={(e) => { e.stopPropagation(); openAnalyze(r.symbol); }} style={{ display: "inline-flex", alignItems: "center", gap: 7, color: C.text, fontWeight: 700, fontSize: 14, textDecoration: "underline", textDecorationColor: C.border, textUnderlineOffset: 3 }}>
+                <CoinIcon symbol={r.symbol} logos={logos} size={20} />
+                {r.symbol.replace("USDT", "")}
+              </span>
+              <span style={{ fontFamily: mono, fontWeight: 800, fontSize: 18, color: r.best.score >= 70 ? C.gain : r.best.score >= 55 ? C.amber : C.textMuted }}>
+                {r.best.score}<span style={{ fontSize: 10, color: C.textDim, fontWeight: 600 }}> /100</span>
+              </span>
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <span style={{ display: "inline-block", padding: "3px 7px", borderRadius: 6, fontSize: 10.5, fontWeight: 800, color: st.color, background: st.bg, fontFamily: sans }}>{r.status}</span>
+              {r.hint && <div style={{ fontSize: 10.5, color: C.amber, marginTop: 4, fontFamily: sans }}>{r.hint}</div>}
+              {r.provisional && <div style={{ fontSize: 10.5, color: C.amber, marginTop: 4, fontFamily: sans }}>PROVISIONAL — live candle not closed</div>}
+              {r.flags.filter((f) => f !== "OI/L-S UNAVAILABLE" && f !== "EMA200 UNAVAILABLE").map((f) => (
+                <span key={f} style={{ display: "inline-block", marginTop: 4, marginRight: 4, fontSize: 9, color: C.amber, border: `1px solid ${C.amber}`, borderRadius: 4, padding: "0 4px", fontFamily: sans }}>{f}</span>
+              ))}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px 8px" }}>
+              <F k="Price">{fmtPrice(r.price)}</F>
+              <F k="24h" color={pctColor(r.change24h)}>{fmtPct(r.change24h)}</F>
+              <F k="R:R (TP2)">{p.rr2 !== null && p.rr2 !== undefined ? p.rr2.toFixed(2) : "—"}</F>
+              <F k="4H trend" color={tr4}>{r.t4.label}</F>
+              <F k="1H structure" color={s1} span={2}>{r.structure1h}</F>
+              <F k="Entry zone" span={2}>{fmtPrice(p.zone.lo)}–{fmtPrice(p.zone.hi)}</F>
+              <F k="Stop" color={C.loss}>{fmtPrice(p.stop)}</F>
+              <F k="TP1" color={C.gain}>{p.targets[0] ? fmtPrice(p.targets[0].price) : "—"}</F>
+              <F k="TP2" color={C.gain}>{p.targets[1] ? fmtPrice(p.targets[1].price) : "—"}</F>
+              <F k="TP3" color={C.gain}>{p.targets[2] ? fmtPrice(p.targets[2].price) : "—"}</F>
+              <F k="OI Δ1h (derived)" color={oi === null ? C.textDim : pctColor(oi)}>{oi === null ? "UNAVAILABLE" : fmtPct(oi)}</F>
+              <F k="Funding" color={r.funding ? pctColor(r.funding.rate) : C.textDim}>{r.funding ? (r.funding.rate * 100).toFixed(4) + "%" : "UNAVAILABLE"}</F>
+              <F k="Data age" color={r.stale ? C.amber : C.textDim}>{klAt ? radarAge(Date.now() - klAt) : "—"}{r.stale ? " STALE" : ""}</F>
+            </div>
+            <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 8, fontFamily: sans }}>{expanded === r.symbol ? "Tap to hide details ▴" : "Tap for full plan & score breakdown ▾"}</div>
+          </div>
+          {expanded === r.symbol && <Detail r={r} bare />}
+        </div>
+      );
+    });
   };
 
   const COLS = 16;
@@ -3472,6 +3543,8 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
     <Card title={`${title} · ${list.length}`} style={{ padding: 0, overflow: "hidden" }}>
       {list.length === 0 ? (
         <div style={{ padding: "16px", fontSize: 12.5, color: C.textMuted }}>{empty}</div>
+      ) : narrow ? (
+        <div>{renderCards({ list, empty })}</div>
       ) : (
         <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
           <table style={{ borderCollapse: "collapse", minWidth: 1260, width: "100%" }}>
@@ -3573,6 +3646,23 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
             <option value="BEARISH">1H: bearish</option>
             <option value="RANGE">1H: range</option>
           </select>
+          {narrow && (
+            <select
+              value={`${sort.key}|${sort.dir}`}
+              onChange={(e) => { const [key, dir] = e.target.value.split("|"); setSort({ key, dir }); }}
+              style={inputStyle}
+            >
+              <option value="score|desc">Sort: score high→low</option>
+              <option value="score|asc">Sort: score low→high</option>
+              <option value="rr|desc">Sort: R:R high→low</option>
+              <option value="change|desc">Sort: 24h % up</option>
+              <option value="change|asc">Sort: 24h % down</option>
+              <option value="price|desc">Sort: price high→low</option>
+              <option value="oi|desc">Sort: OI Δ high→low</option>
+              <option value="funding|desc">Sort: funding high→low</option>
+              <option value="symbol|asc">Sort: symbol A→Z</option>
+            </select>
+          )}
           <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textMuted }}>
             Min score
             <input type="number" min="0" max="100" value={cfg.minScore} onChange={(e) => set("minScore", Math.max(0, Math.min(100, Number(e.target.value) || 0)))} style={{ ...inputStyle, width: 64 }} />
