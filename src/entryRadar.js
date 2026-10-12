@@ -29,7 +29,7 @@ export const STATUS = {
   INSUFFICIENT: "INSUFFICIENT DATA",
 };
 
-export const TF_MS = { "5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000 };
+export const TF_MS = { "5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000, "1d": 86400000 };
 
 export const DEFAULT_SETTINGS = {
   feePct: 0.05, // taker fee per side, % of notional (configurable)

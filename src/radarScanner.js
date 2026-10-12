@@ -24,10 +24,12 @@
 import { analyzeFrame, evaluateSymbol, TF_MS } from "./entryRadar.js";
 
 export const KLINE_LIMIT = 250; // enough closed candles for EMA200 with margin
-const MAX_KLINE_AGE = { "5m": 10 * 60_000, "15m": 15 * 60_000, "1h": 20 * 60_000, "4h": 30 * 60_000 };
+const MAX_KLINE_AGE = { "5m": 10 * 60_000, "15m": 15 * 60_000, "1h": 20 * 60_000, "4h": 30 * 60_000, "1d": 2 * 3600_000 };
 const EXCHANGE_TTL = 60 * 60_000;
 const BOOK_TTL = 10_000;
 const DERIV_TTL = 5 * 60_000;
+const MARK_TTL = 10_000;
+const DEPTH_TTL = 30_000;
 
 export class RateLimitedError extends Error {
   constructor(msg) {
@@ -76,7 +78,7 @@ export function createRadarScanner(deps) {
   } = deps;
   const spent = []; // [timestamp, weight] of recent radar requests
 
-  const cache = { exchange: null, book: null, klines: new Map(), deriv: new Map(), derivExt: new Map() };
+  const cache = { exchange: null, book: null, klines: new Map(), deriv: new Map(), derivExt: new Map(), mark: new Map(), depth: new Map() };
   const inflight = new Map();
   const stats = { requests: 0, retries: 0, rateLimited: 0, dedupHits: 0 };
 
@@ -397,7 +399,38 @@ export function createRadarScanner(deps) {
     return { frames, ages, fetchedAt, at: t };
   }
 
+  // ----------------------------------------------- mark price + order-book depth
+  // /fapi/v1/premiumIndex (weight 1) and /fapi/v1/depth?limit=500 (weight 10), both documented.
+  const num = (x) => { const v = parseFloat(x); return Number.isFinite(v) ? v : null; };
+  async function getMark(symbol, { force = false } = {}) {
+    const hit = cache.mark.get(symbol);
+    if (!force && hit && now() - hit.at < MARK_TTL) return hit.data;
+    return dedupe("m:" + symbol, async () => {
+      const d = await request(`${base}/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`, 1);
+      if (!d || typeof d !== "object" || Array.isArray(d)) throw new Error("Unexpected premiumIndex response");
+      const mark = num(d.markPrice);
+      const data = { at: now(), mark: mark !== null && mark > 0 ? mark : null, index: num(d.indexPrice), fundingRate: num(d.lastFundingRate), nextFundingTime: Number.isFinite(Number(d.nextFundingTime)) && Number(d.nextFundingTime) > 0 ? Number(d.nextFundingTime) : null };
+      cache.mark.set(symbol, { at: data.at, data });
+      return data;
+    });
+  }
+  async function getDepth(symbol, { force = false, limit = 500 } = {}) {
+    const hit = cache.depth.get(symbol);
+    if (!force && hit && now() - hit.at < DEPTH_TTL) return hit.data;
+    return dedupe("p:" + symbol, async () => {
+      const d = await request(`${base}/fapi/v1/depth?symbol=${encodeURIComponent(symbol)}&limit=${limit}`, limit >= 500 ? 10 : limit >= 100 ? 5 : 2);
+      if (!d || !Array.isArray(d.bids) || !Array.isArray(d.asks)) throw new Error("Unexpected depth response");
+      const data = { at: now(), bids: d.bids, asks: d.asks };
+      cache.depth.set(symbol, { at: data.at, data });
+      return data;
+    });
+  }
+
   return {
+    getMark,
+    getDepth,
+    peekMark: (symbol) => cache.mark.get(symbol)?.data || null,
+    peekDepth: (symbol) => cache.depth.get(symbol)?.data || null,
     getFrames,
     getDerivExt,
     hasDerivExt: (symbol, period) => cache.derivExt.has(`${symbol}|${period}`),
@@ -415,6 +448,8 @@ export function createRadarScanner(deps) {
       cache.klines.clear();
       cache.deriv.clear();
       cache.derivExt.clear();
+      cache.mark.clear();
+      cache.depth.clear();
       cache.book = null;
     },
     stats,

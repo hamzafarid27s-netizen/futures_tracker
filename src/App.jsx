@@ -4,6 +4,8 @@ import { analyzeCandles, MIN_ANALYSIS_CANDLES } from "./deepAnalysis";
 import { createRadarScanner, orderSymbols } from "./radarScanner";
 import { STATUS, DEFAULT_SETTINGS } from "./entryRadar";
 import { evaluateReversal, createSignalLog, normalizeSymbol, REV_STATE, REV_TFS, REV_DEFAULTS, FLOW } from "./reversal";
+import { buildLiquidityMap, planForZone, LIQ_KIND, LIQ_TFS, LIQ_DEFAULTS, fmtUsd } from "./liqZones";
+import { createLiqStream } from "./liqStream";
 import { evaluateSmartEntry, positionSize, symbolCheck, SMART_STATUS, SMART_DEFAULTS, NO_VALID_ZONE } from "./smartEntry";
 
 const DARK_THEME = {
@@ -359,6 +361,9 @@ export default function FuturesTracker() {
   const [newAlertForm, setNewAlertForm] = useState({ symbol: "", min: 60, pct: 5, dir: "either" });
   const [analyzeSymbol, setAnalyzeSymbol] = useState(null);
   const [analyzePrefill, setAnalyzePrefill] = useState(null); // symbol sent from Entry Radar
+  const [liqPrefill, setLiqPrefill] = useState(null); // symbol sent from Entry Radar to the Liquidity Map
+  const openLiquidityFor = (sym, tf) => { setLiqPrefill({ symbol: sym, tf, n: Date.now() }); setTab("liquidity"); };
+  const openAnalyzeFromLiquidity = (o) => { setAnalyzePrefill({ symbol: o.symbol, n: Date.now(), section: "smart", tf: o.tf, overlay: o }); setTab("analyze"); };
   const openAnalyzeFromReversal = (sym, tf) => { setAnalyzePrefill({ symbol: sym, n: Date.now(), section: "deep", tf }); setTab("analyze"); };
   const openAnalyzeFromRadar = (sym) => { setAnalyzePrefill({ symbol: sym, n: Date.now(), section: "smart" }); setTab("analyze"); };
   const [coinLogos, setCoinLogos] = useState({});
@@ -1673,7 +1678,7 @@ export default function FuturesTracker() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${C.border}`, overflowX: "auto" }}>
-          {["market", "analyze", "trades", "screener", "radar", "reversal", "alerts"].map((t) => (
+          {["market", "analyze", "trades", "screener", "radar", "reversal", "liquidity", "alerts"].map((t) => (
             <div
               key={t}
               className="ft-tab"
@@ -1689,7 +1694,7 @@ export default function FuturesTracker() {
                 whiteSpace: "nowrap",
               }}
             >
-              {t === "radar" ? "Entry Radar" : t === "reversal" ? "Early Reversal" : t === "alerts" && triggered.length > 0
+              {t === "radar" ? "Entry Radar" : t === "reversal" ? "Early Reversal" : t === "liquidity" ? "Liquidity Map" : t === "alerts" && triggered.length > 0
                 ? `Alerts · ${triggered.length}`
                 : t === "trades" && savedTrades.length > 0
                 ? `Trades · ${savedTrades.length}`
@@ -1870,11 +1875,14 @@ export default function FuturesTracker() {
           />
         )}
 
+        {tab === "liquidity" && (
+          <LiquidityMapTab rows={rows} funding={funding} logos={coinLogos} openAnalyze={openAnalyzeFromLiquidity} prefill={liqPrefill} />
+        )}
         {tab === "reversal" && (
           <EarlyReversalTab rows={rows} funding={funding} logos={coinLogos} openAnalyze={openAnalyzeFromReversal} />
         )}
         {tab === "radar" && (
-          <EntryRadarTab rows={rows} funding={funding} logos={coinLogos} openAnalyze={openAnalyzeFromRadar} />
+          <EntryRadarTab rows={rows} funding={funding} logos={coinLogos} openAnalyze={openAnalyzeFromRadar} openLiquidity={openLiquidityFor} />
         )}
 
         {tab === "trades" && (
@@ -3104,7 +3112,7 @@ function radarAge(ms) {
   return Math.round(s / 3600) + "h";
 }
 
-function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
+function EntryRadarTab({ rows, funding, logos, openAnalyze, openLiquidity }) {
   const scanner = getRadarScanner();
   const [cfg, setCfg] = useState(RADAR_DEFAULTS);
   const cfgLoaded = useRef(false);
@@ -3462,6 +3470,25 @@ function EntryRadarTab({ rows, funding, logos, openAnalyze }) {
               <div style={line}>Price/OI combinations are possibilities (e.g. price↑ + OI↑ may be new longs, or may not), never proof of who is trading.</div>
               <div style={line}>Data age — candles fetched: 4H {radarAge(r.freshness?.klinesFetchedAt?.["4h"] ? Date.now() - r.freshness.klinesFetchedAt["4h"] : null)}, 1H {radarAge(r.freshness?.klinesFetchedAt?.["1h"] ? Date.now() - r.freshness.klinesFetchedAt["1h"] : null)}, 15m {radarAge(r.freshness?.klinesFetchedAt?.["15m"] ? Date.now() - r.freshness.klinesFetchedAt["15m"] : null)} · price {radarAge(r.freshness?.tickerAgeMs)} ago · OI/L-S {d && r.freshness?.derivFetchedAt ? radarAge(Date.now() - r.freshness.derivFetchedAt) + " ago" : "UNAVAILABLE"}</div>
               {r.flags.includes("EMA200 UNAVAILABLE") && <div style={{ ...line, color: C.amber }}>EMA200 UNAVAILABLE — fewer than 200 closed 4H candles (newer listing); EMA20/50 and structure are used.</div>}
+              {(() => {
+                if (!scanner.hasKlines(r.symbol, ["1h"])) return null;
+                const g = scanner.getFrames(r.symbol, ["1h"]);
+                const lm = buildLiquidityMap({ symbol: r.symbol, tf: "1h", frame: g.frames["1h"], lastPrice: r.price, ages: { "1h": g.ages["1h"] }, now: Date.now() });
+                if (!lm.ok) return <div style={line}>Liquidity map: {lm.state === "STALE" ? "DATA STALE" : "INSUFFICIENT DATA"}.</div>;
+                const za = lm.nearest.above, zb = lm.nearest.below;
+                const fz = (z) => (z ? `${fmtPrice(z.lo)}–${fmtPrice(z.hi)} (${z.distPct.toFixed(2)}%, ${z.kind === LIQ_KIND.ESTIMATED ? "estimated" : z.kind === LIQ_KIND.LIQUIDITY ? "assumed stops" : z.kind === LIQ_KIND.OBSERVED ? "observed" : "order-book"}, ${z.strength})` : "none");
+                // a plan whose stop sits just inside a strong liquidity pool is easy to sweep
+                const stopNearPool = lm.zones.find((z) => z.kind === LIQ_KIND.LIQUIDITY && p.stop >= z.lo - lm.atr * 0.3 && p.stop <= z.hi + lm.atr * 0.3 && z.strength >= 50);
+                return (
+                  <>
+                    <div style={line}>Liquidity map (1H, <span style={{ color: C.textDim }}>estimates + assumed stop pools, not observed</span>): above {fz(za)} · below {fz(zb)}</div>
+                    {stopNearPool && <div style={{ ...line, color: C.amber }}>⚠ The stop sits next to a liquidity pool ({fmtPrice(stopNearPool.lo)}–{fmtPrice(stopNearPool.hi)}); stops near equal highs/lows are often swept first.</div>}
+                    <div style={{ marginTop: 6 }}>
+                      <button onClick={() => openLiquidity && openLiquidity(r.symbol, "1h")} className="ft-btn" style={{ background: C.panelAlt, color: C.blue, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 11px", fontSize: 11.5, fontWeight: 700 }}>Open in Liquidity Map</button>
+                    </div>
+                  </>
+                );
+              })()}
               <div style={{ ...line, color: C.textDim }}>Setup ID: {r.id}</div>
               <div style={{ marginTop: 8 }}>
                 <button onClick={() => openAnalyze(r.symbol)} className="ft-btn" style={{ background: C.amber, color: "#1A1300", border: "none", borderRadius: 6, padding: "7px 12px", fontSize: 12, fontWeight: 700 }}>
@@ -3814,7 +3841,7 @@ const fmtClock = (t) => (t ? new Date(t).toLocaleString([], { month: "short", da
 
 // Candlestick chart with the entry-zone band, preferred entry, stop, invalidation,
 // targets and key support/resistance. Pure SVG, scales to the container width.
-function SmartEntryChart({ frame, plan, price, keyLevels, tf }) {
+function SmartEntryChart({ frame, plan, price, keyLevels, tf, overlay }) {
   if (!frame || !frame.closed || frame.closed.length < 10) {
     return <div style={{ fontSize: 12, color: C.textMuted, padding: 12 }}>Chart UNAVAILABLE — not enough {tf.toUpperCase()} candles.</div>;
   }
@@ -3829,7 +3856,7 @@ function SmartEntryChart({ frame, plan, price, keyLevels, tf }) {
     lines.push({ p: plan.invalidation, c: "#FF9F5C", d: "4 3", label: "Invalid." });
     plan.targets.forEach((t) => lines.push({ p: t.price, c: C.gain, d: "6 3", label: t.label }));
   }
-  const vals = candles.flatMap((c) => [c.h, c.l]).concat(lines.map((l) => l.p), plan && plan.zone ? [plan.zone.lo, plan.zone.hi] : []);
+  const vals = candles.flatMap((c) => [c.h, c.l]).concat(lines.map((l) => l.p), plan && plan.zone ? [plan.zone.lo, plan.zone.hi] : [], overlay ? [overlay.lo, overlay.hi] : []);
   let lo = Math.min(...vals), hi = Math.max(...vals);
   const padV = (hi - lo) * 0.04 || hi * 0.01;
   lo -= padV;
@@ -3853,6 +3880,13 @@ function SmartEntryChart({ frame, plan, price, keyLevels, tf }) {
       {levels.map((z, i) => (
         <rect key={"sr" + i} x={padL} width={W - padL - padR} y={y(Math.max(z.hi, z.lo + (hi - lo) * 0.002))} height={Math.max(1.5, y(z.lo) - y(Math.max(z.hi, z.lo + (hi - lo) * 0.002)))} fill={C.textDim} opacity={0.14} />
       ))}
+      {overlay && (
+        <g>
+          <rect x={padL} width={W - padL - padR} y={y(overlay.hi)} height={Math.max(2, y(overlay.lo) - y(overlay.hi))} fill={C.blue} opacity={0.18} />
+          <rect x={padL} width={W - padL - padR} y={y(overlay.hi)} height={Math.max(2, y(overlay.lo) - y(overlay.hi))} fill="none" stroke={C.blue} strokeWidth="1.4" strokeDasharray="5 3" />
+          <text x={padL + 4} y={y(overlay.lo) + 11} fontSize="10" fill={C.blue} fontFamily={sans}>{overlay.label} {fmtPrice(overlay.lo)} – {fmtPrice(overlay.hi)}</text>
+        </g>
+      )}
       {plan && plan.zone && (
         <g>
           <rect x={padL} width={W - padL - padR} y={y(plan.zone.hi)} height={Math.max(2, y(plan.zone.lo) - y(plan.zone.hi))} fill={plan.side === 1 ? C.gain : C.loss} opacity={0.2} />
@@ -3888,7 +3922,7 @@ function SmartEntryChart({ frame, plan, price, keyLevels, tf }) {
   );
 }
 
-function SmartEntryPanel({ rows, funding, logos, symbolText, setSymbolText }) {
+function SmartEntryPanel({ rows, funding, logos, symbolText, setSymbolText, overlay }) {
   const scanner = getRadarScanner();
   const [cfg, setCfg] = useState(SMART_DEFAULT_CFG);
   const cfgLoaded = useRef(false);
@@ -3901,6 +3935,7 @@ function SmartEntryPanel({ rows, funding, logos, symbolText, setSymbolText }) {
   const [showHelp, setShowHelp] = useState(false);
   const [showSizing, setShowSizing] = useState(true);
   const reqId = useRef(0);
+  const [overlayOff, setOverlayOff] = useState(null); // `at` of the overlay the user dismissed
 
   useEffect(() => {
     (async () => {
@@ -4016,6 +4051,35 @@ function SmartEntryPanel({ rows, funding, logos, symbolText, setSymbolText }) {
 
   return (
     <div>
+      {overlay && overlay.zone && overlay.at !== overlayOff && symbol === overlay.zone.symbol && (() => {
+        const z = overlay.zone;
+        const lf = ev && ev.frames ? ev.frames[cfg.tf] : null;
+        const live = row ? parseFloat(row.lastPrice) : null;
+        const atrNow = lf && lf.atr ? lf.atr : null;
+        const away = live && live > 0 ? (z.lo > live ? z.lo - live : z.hi < live ? live - z.hi : 0) : null;
+        const warnFar = away !== null && ((atrNow && away / atrNow > LIQ_DEFAULTS.maxDistanceAtr) || (away / live) * 100 > LIQ_DEFAULTS.maxDistancePct);
+        const kindTag = z.kind === LIQ_KIND.ESTIMATED ? "ESTIMATED (model)" : z.kind === LIQ_KIND.OBSERVED ? "OBSERVED (real liquidations)" : z.kind === LIQ_KIND.LIQUIDITY ? "LIQUIDITY POOL (assumed stops)" : "ORDER-BOOK WALL (snapshot)";
+        return (
+          <Card title="Zone from Liquidity Map" right={<span onClick={() => setOverlayOff(overlay.at)} className="ft-btn" style={{ fontSize: 11, color: C.textMuted }}>Dismiss</span>}>
+            <div style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+              <b style={{ color: C.blue }}>{kindTag}</b> · {z.label} · {z.dir}<br />
+              <span style={{ fontFamily: mono }}>{fmtPrice(z.lo)} – {fmtPrice(z.hi)}</span> · strength {z.strength}/100 · snapshot from the {overlay.tf} map at {fmtClock(overlay.at)}
+              {away !== null && <div style={{ color: C.textMuted }}>Now {away === 0 ? "inside the zone" : `${fmtPrice(away)} (${((away / live) * 100).toFixed(2)}%) away`} · invalidation: {z.invalidation.text}</div>}
+            </div>
+            {warnFar && <div style={{ fontSize: 11.5, color: C.amber, marginTop: 6 }}>⚠ Entry is too far from the current price for a near-term plan.</div>}
+            {overlay.plan && overlay.plan.scenarios.map((sc) => (
+              <div key={sc.name} style={{ background: C.panelAlt, borderRadius: 8, padding: "9px 11px", marginTop: 8, fontSize: 11.5, lineHeight: 1.55, color: C.textMuted }}>
+                <b style={{ color: C.text }}>{sc.name}</b> <span style={{ color: sc.dir === 1 ? C.gain : C.loss, fontWeight: 800 }}>{sc.side}</span><br />
+                Trigger: {sc.trigger}{sc.ready ? " — already confirmed" : ""}<br />
+                Entry {fmtPrice(sc.entry)} · stop {fmtPrice(sc.stop)}{sc.targets.map((t) => ` · ${t.label} ${fmtPrice(t.price)} (net R:R ${t.rr === null ? "—" : t.rr.toFixed(2)})`).join("")}<br />
+                {sc.warnings.map((w, i) => <span key={i} style={{ color: C.amber, display: "block" }}>⚠ {w}</span>)}
+              </div>
+            ))}
+            <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 8, lineHeight: 1.5 }}>Candidate levels only — not guaranteed and nothing is traded for you. R:R is net of fees and slippage. If a higher-timeframe trend disagrees, the plan above says so.</div>
+            {lf && <div style={{ marginTop: 10 }}><SmartEntryChart frame={lf} plan={null} price={price} keyLevels={ev.keyLevels} tf={cfg.tf} overlay={{ lo: z.lo, hi: z.hi, label: "Liquidity zone" }} /></div>}
+          </Card>
+        );
+      })()}
 
       <Card title="Pair">
         <SymbolPicker rows={rows} logos={logos} value={symbolText} onChange={setSymbolText} onSelect={(s) => setSymbolText(s.replace("USDT", ""))} placeholder="Pair, e.g. BTC — tap to browse" />
@@ -4146,7 +4210,7 @@ function SmartEntryPanel({ rows, funding, logos, symbolText, setSymbolText }) {
                 </div>
               }
             >
-              <SmartEntryChart frame={ev.frames[cfg.tf]} plan={active.plan} price={price} keyLevels={ev.keyLevels} tf={cfg.tf} />
+              <SmartEntryChart frame={ev.frames[cfg.tf]} plan={active.plan} price={price} keyLevels={ev.keyLevels} tf={cfg.tf} overlay={overlay && overlay.zone && overlay.at !== overlayOff && symbol === overlay.zone.symbol ? { lo: overlay.zone.lo, hi: overlay.zone.hi, label: "Liquidity zone" } : null} />
               <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", fontSize: 10.5, color: C.textMuted, marginTop: 8 }}>
                 <span><b style={{ color: activeSide === 1 ? C.gain : C.loss }}>▮</b> entry zone</span>
                 <span><b style={{ color: C.amber }}>━</b> preferred entry</span>
@@ -4998,6 +5062,649 @@ function EarlyReversalTab({ rows, funding, logos, openAnalyze }) {
   );
 }
 
+// =====================================================================
+// LIQUIDATION HEATMAP & LIQUIDITY ZONES — analysis lives in liqZones.js,
+// data fetching in radarScanner.js, live liquidation events in liqStream.js.
+// Estimated zones are a MODEL (assumptions are listed on screen); observed
+// events are real liquidation orders received while this page was open.
+// =====================================================================
+let liqStreamSingleton = null;
+function getLiqStream() {
+  if (!liqStreamSingleton) liqStreamSingleton = createLiqStream({});
+  return liqStreamSingleton;
+}
+const LIQ_SCOPES = [{ key: "20", n: 20 }, { key: "40", n: 40 }, { key: "60", n: 60 }];
+const LIQ_REFRESH = [[0, "Manual"], [15, "15 s"], [30, "30 s"], [60, "1 min"], [300, "5 min"]];
+const LIQ_LOOKBACKS = [100, 150, 200, 250];
+const LIQ_LAYERS = [
+  ["est", "Estimated liq zones"], ["pool", "Liquidity pools"], ["obs", "Observed liquidations"], ["depth", "Order-book walls"],
+  ["heat", "Heat strip"], ["swing", "Swing levels"], ["sr", "Support/resistance"], ["events", "Sweeps & breaks"],
+];
+const LIQ_UI_DEFAULTS = {
+  tf: "1h", lookback: 200, refreshSec: 30, scope: "20", minStrength: 30, maxDistPct: 15, dirFilter: "all", kindFilter: "all", range: "normal",
+  feePct: 0.05, slippagePct: 0.03, leverages: [10, 25, 50, 100], mmr: 0.5,
+  layers: { est: true, pool: true, obs: true, depth: true, heat: true, swing: false, sr: false, events: true },
+};
+
+function liqKindStyle(z) {
+  if (z.kind === LIQ_KIND.OBSERVED) return { color: C.amber, fill: C.amber, op: 0.28, stroke: C.amber, sw: 1.8, dash: "", hatch: null, tag: "OBSERVED" };
+  if (z.kind === LIQ_KIND.ESTIMATED) { const below = z.side === "below"; return { color: below ? C.loss : C.gain, fill: below ? "url(#liqHatchLoss)" : "url(#liqHatchGain)", op: 1, stroke: below ? C.loss : C.gain, sw: 0.8, dash: "2 3", hatch: true, tag: "ESTIMATE" }; }
+  if (z.kind === LIQ_KIND.LIQUIDITY) return { color: C.blue, fill: C.blue, op: 0.08, stroke: C.blue, sw: 1.2, dash: "6 3", hatch: null, tag: "ASSUMED STOPS" };
+  return { color: "#B58CFF", fill: "#B58CFF", op: 0.14, stroke: "#B58CFF", sw: 1, dash: "1 2", hatch: null, tag: "SNAPSHOT" };
+}
+const liqShort = (z) => (z.kind === LIQ_KIND.ESTIMATED ? (z.side === "below" ? "EST long-liq" : "EST short-liq") : z.kind === LIQ_KIND.OBSERVED ? (z.dir.startsWith("LONG") ? "OBS long-liq" : "OBS short-liq") : z.kind === LIQ_KIND.LIQUIDITY ? (z.poolSide === 1 ? "buy-side liq." : "sell-side liq.") : z.dir.includes("BUY") ? "bid wall" : "ask wall");
+const liqTime = (t) => (t ? new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "UNAVAILABLE");
+
+function LiqChart({ map, frame, layers, view, setView, selectedId, onSelect, observed, srZones }) {
+  const [info, setInfo] = useState("");
+  if (!map || !map.ok || !frame || !frame.closed) return null;
+  const closedAll = frame.closed;
+  const nAll = closedAll.length;
+  const W = 760, H = 400, padL = 8, padR = 112, padT = 12, padB = 26;
+  const count = Math.max(20, Math.min(view.count, nAll));
+  const off = Math.max(0, Math.min(view.offset, nAll - count));
+  const startIdx = nAll - off - count;
+  const vis = closedAll.slice(startIdx, startIdx + count);
+  const showForming = off === 0 && frame.forming;
+  const candles = showForming ? [...vis, { ...frame.forming, forming: true }] : vis;
+  const nC = candles.length;
+  const lowC = Math.min(...candles.map((c) => c.l)), highC = Math.max(...candles.map((c) => c.h));
+  const padPct = view.range === "tight" ? 0.06 : view.range === "wide" ? 0.45 : 0.18;
+  const span = (highC - lowC) || highC * 0.01;
+  let lo = lowC - span * padPct, hi = highC + span * padPct;
+  if (isFinite(map.price)) { lo = Math.min(lo, map.price - span * 0.02); hi = Math.max(hi, map.price + span * 0.02); }
+  const x = (i) => padL + ((W - padL - padR) * (i + 0.5)) / nC;
+  const y = (p) => padT + ((hi - p) / (hi - lo)) * (H - padT - padB);
+  const bw = Math.max(1.5, ((W - padL - padR) / nC) * 0.62);
+  const plotR = W - padR;
+  const inR = (p) => p >= lo && p <= hi;
+  const zones = map.zones.filter((z) => z.hi >= lo && z.lo <= hi && ((z.kind === LIQ_KIND.ESTIMATED && layers.est) || (z.kind === LIQ_KIND.LIQUIDITY && layers.pool) || (z.kind === LIQ_KIND.OBSERVED && layers.obs) || (z.kind === LIQ_KIND.DEPTH && layers.depth)));
+  const bandY = (z) => { const t = y(Math.max(z.hi, z.lo + (hi - lo) * 0.003)); return { y: t, h: Math.max(2, y(z.lo) - t) }; };
+  // label only the bands that are not crowded by a stronger band's label
+  const labelled = new Set();
+  { let lastY = -99; [...zones].sort((a, b) => bandY(a).y - bandY(b).y).forEach((z) => { const by = bandY(z).y; if (by - lastY >= 11) { labelled.add(z.id); lastY = by; } }); }
+  const idxOfTime = (t) => {
+    for (let i = startIdx + vis.length - 1; i >= startIdx; i--) if (closedAll[i].t <= t) return t < closedAll[i].t + frame.tfMs ? i - startIdx : (i === startIdx + vis.length - 1 && showForming ? vis.length : null);
+    return null;
+  };
+  const stepX = Math.max(1, Math.round(nC / 6));
+  const fmtT = (t) => (frame.tf === "1d" ? new Date(t).toLocaleDateString([], { month: "short", day: "numeric" }) : new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }));
+  const heat = layers.heat ? (map.heat || []).filter((b) => b.hi >= lo && b.lo <= hi) : [];
+  const evs = layers.events ? (map.events || []).filter((e) => e.i >= startIdx && e.i <= nAll) : [];
+  const obsEv = layers.obs && observed ? observed.filter((e) => e.symbol === map.symbol) : [];
+  const maxN = Math.max(1, ...obsEv.map((e) => e.notional));
+  const swings = layers.swing ? (map.swings || []).filter((s) => s.i >= startIdx && s.i < startIdx + vis.length && inR(s.price)) : [];
+  const sr = layers.sr ? (srZones || []).filter((z) => z.hi >= lo && z.lo <= hi) : [];
+  return (
+    <div>
+      <div style={{ minHeight: 18, fontSize: 11, color: C.textMuted, fontFamily: mono, marginBottom: 4 }}>{info || "Tap or hover a band for details; tap selects it."}</div>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block", background: C.panelAlt, borderRadius: 8, touchAction: "pan-y" }} role="img" aria-label="Candlestick chart with estimated liquidation zones, liquidity pools, observed liquidations and order-book walls" onMouseLeave={() => setInfo("")}>
+        <defs>
+          <pattern id="liqHatchLoss" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill={C.loss} opacity="0.07" /><line x1="0" y1="0" x2="0" y2="6" stroke={C.loss} strokeWidth="2" opacity="0.5" /></pattern>
+          <pattern id="liqHatchGain" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(-45)"><rect width="6" height="6" fill={C.gain} opacity="0.07" /><line x1="0" y1="0" x2="0" y2="6" stroke={C.gain} strokeWidth="2" opacity="0.5" /></pattern>
+        </defs>
+        {sr.map((z, i) => <rect key={"sr" + i} x={padL} width={plotR - padL} y={y(Math.max(z.hi, z.lo + (hi - lo) * 0.002))} height={Math.max(1.5, y(z.lo) - y(Math.max(z.hi, z.lo + (hi - lo) * 0.002)))} fill={C.textDim} opacity={0.13} />)}
+        {zones.map((z) => {
+          const st = liqKindStyle(z), b = bandY(z);
+          const o = st.hatch ? 0.35 + (0.65 * z.strength) / 100 : st.op + (0.4 * z.strength) / 100 * (z.kind === LIQ_KIND.OBSERVED ? 0.6 : 0.3);
+          const sel = z.id === selectedId;
+          const depthW = z.kind === LIQ_KIND.DEPTH;
+          return (
+            <g key={z.id} style={{ cursor: "pointer" }} onClick={() => onSelect(z.id)} onMouseEnter={() => setInfo(`${z.label} · ${z.dir} · ${fmtPrice(z.lo)}–${fmtPrice(z.hi)} · strength ${z.strength}/100 · ${z.distPct === null ? "" : z.distPct.toFixed(2) + "% away · "}${st.tag}`)}>
+              <rect x={depthW ? plotR - 90 : padL} width={depthW ? 90 : plotR - padL} y={b.y} height={b.h} fill={st.fill} opacity={o} />
+              <rect x={depthW ? plotR - 90 : padL} width={depthW ? 90 : plotR - padL} y={b.y} height={b.h} fill="none" stroke={st.stroke} strokeWidth={sel ? 2.6 : st.sw} strokeDasharray={st.dash} opacity={sel ? 1 : 0.8} />
+              {(labelled.has(z.id) || sel) && <text x={padL + 4} y={b.y + Math.min(b.h, 11) - 1} fontSize="9.5" fill={st.color} fontFamily={sans} fontWeight="700">{liqShort(z)} {z.strength}</text>}
+            </g>
+          );
+        })}
+        {candles.map((c, i) => {
+          const up = c.c >= c.o, col = up ? C.gain : C.loss;
+          return (
+            <g key={c.t} opacity={c.forming ? 0.5 : 1} onMouseEnter={() => setInfo(`${fmtT(c.t)} · O ${fmtPrice(c.o)} H ${fmtPrice(c.h)} L ${fmtPrice(c.l)} C ${fmtPrice(c.c)} · vol ${fmtVol(c.qv)}${c.forming ? " · forming" : ""}`)}>
+              <line x1={x(i)} x2={x(i)} y1={y(c.h)} y2={y(c.l)} stroke={col} strokeWidth="1" />
+              <rect x={x(i) - bw / 2} y={y(Math.max(c.o, c.c))} width={bw} height={Math.max(1, Math.abs(y(c.o) - y(c.c)))} fill={c.forming ? "none" : col} stroke={col} strokeWidth="1" strokeDasharray={c.forming ? "2 2" : ""} />
+            </g>
+          );
+        })}
+        {swings.map((s, k) => <g key={"sw" + k}><line x1={x(s.i - startIdx) - 6} x2={x(s.i - startIdx) + 6} y1={y(s.price)} y2={y(s.price)} stroke={C.text} strokeWidth="1.2" opacity="0.8" /><circle cx={x(s.i - startIdx)} cy={y(s.price) + (s.type === "high" ? -4 : 4)} r="2" fill={C.text} opacity="0.8" /></g>)}
+        {obsEv.map((e, k) => {
+          const ix = idxOfTime(e.t);
+          if (ix === null || !inR(e.price)) return null;
+          const r = 3 + 7 * Math.sqrt(e.notional / maxN);
+          return <circle key={"ob" + k} cx={x(ix)} cy={y(e.price)} r={r} fill={e.side === "SELL" ? C.loss : C.gain} fillOpacity="0.55" stroke={C.amber} strokeWidth="1.6" onMouseEnter={() => setInfo(`OBSERVED ${e.side === "SELL" ? "LONG" : "SHORT"} liquidation · ${fmtUsd(e.notional)} at ${fmtPrice(e.price)} · ${liqTime(e.t)}`)} />;
+        })}
+        {evs.map((e, k) => {
+          const ix = e.i - startIdx;
+          if (ix < 0 || ix > nC) return null;
+          const conf = e.state === "CONFIRMED";
+          const py = inR(e.level) ? y(e.level) : null;
+          if (py === null) return null;
+          return (
+            <g key={"ev" + k} onMouseEnter={() => setInfo(`${e.state} · ${e.type} · level ${fmtPrice(e.level)} · ${e.evidence[0] || ""}`)}>
+              <path d={e.side === 1 ? `M${x(Math.min(ix, nC - 1))},${py - 12} l-5,-8 h10 z` : `M${x(Math.min(ix, nC - 1))},${py + 12} l-5,8 h10 z`} fill={conf ? C.text : "none"} stroke={C.text} strokeWidth="1.2" />
+            </g>
+          );
+        })}
+        {heat.map((b, k) => <rect key={"h" + k} x={plotR + 4} width={4 + 36 * b.v} y={y(b.hi)} height={Math.max(1.5, y(b.lo) - y(b.hi))} fill={b.side === -1 ? C.loss : C.gain} opacity={0.25 + 0.6 * b.v} />)}
+        {layers.heat && <text x={plotR + 4} y={padT + 8} fontSize="8.5" fill={C.textDim} fontFamily={sans}>heat (estimate)</text>}
+        {isFinite(map.price) && inR(map.price) && (
+          <g>
+            <line x1={padL} x2={plotR} y1={y(map.price)} y2={y(map.price)} stroke={C.text} strokeWidth="1" strokeDasharray="1 3" opacity="0.8" />
+            <text x={plotR + 48} y={y(map.price) + 3} fontSize="9.5" fill={C.text} fontFamily={mono}>{map.priceSource.startsWith("OFFICIAL mark") ? "Mark" : "Price"} {fmtPrice(map.price)}</text>
+          </g>
+        )}
+        {candles.map((c, i) => (i % stepX === 0 ? <text key={"t" + i} x={x(i)} y={H - 9} fontSize="9" fill={C.textDim} fontFamily={sans} textAnchor={i === 0 ? "start" : "middle"}>{fmtT(c.t)}</text> : null))}
+      </svg>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, alignItems: "center" }}>
+        <span style={{ fontSize: 10.5, color: C.textDim }}>Zoom</span>
+        <button type="button" className="ft-btn" onClick={() => setView((v) => ({ ...v, count: Math.max(20, Math.round(v.count * 0.7)) }))} style={liqPill(false)}>＋</button>
+        <button type="button" className="ft-btn" onClick={() => setView((v) => ({ ...v, count: Math.min(nAll, Math.round(v.count / 0.7)) }))} style={liqPill(false)}>－</button>
+        <button type="button" className="ft-btn" onClick={() => setView((v) => ({ ...v, offset: Math.min(nAll - Math.min(v.count, nAll), v.offset + Math.max(5, Math.round(v.count / 3))) }))} style={liqPill(false)}>← older</button>
+        <button type="button" className="ft-btn" onClick={() => setView((v) => ({ ...v, offset: Math.max(0, v.offset - Math.max(5, Math.round(v.count / 3))) }))} style={liqPill(false)}>newer →</button>
+        <button type="button" className="ft-btn" onClick={() => setView((v) => ({ ...v, count: Math.min(90, nAll), offset: 0 }))} style={liqPill(false)}>Reset</button>
+        <span style={{ fontSize: 10.5, color: C.textDim, marginLeft: 6 }}>Price range</span>
+        {["tight", "normal", "wide"].map((r) => <button key={r} type="button" className="ft-btn" onClick={() => setView((v) => ({ ...v, range: r }))} style={liqPill(view.range === r)}>{r}</button>)}
+        <span style={{ fontSize: 10.5, color: C.textDim }}>{count} candles shown</span>
+      </div>
+    </div>
+  );
+}
+function liqPill(on) {
+  return { background: on ? C.blue : C.panelAlt, color: on ? "#fff" : C.text, border: `1px solid ${on ? C.blue : C.border}`, borderRadius: 6, padding: "5px 10px", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: sans };
+}
+
+function LiqLegend() {
+  const sw = (bg, border, dash, hatch) => <span style={{ display: "inline-block", width: 22, height: 11, verticalAlign: "middle", marginRight: 5, background: hatch ? `repeating-linear-gradient(45deg, ${hatch} 0 2px, transparent 2px 5px)` : bg, border: `1.5px ${dash ? "dashed" : "solid"} ${border}`, borderRadius: 2 }} />;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 14px", fontSize: 10.5, color: C.textMuted, marginTop: 8, lineHeight: 1.4 }}>
+      <span>{sw("transparent", C.loss, true, C.loss)}ESTIMATED long liquidations (model)</span>
+      <span>{sw("transparent", C.gain, true, C.gain)}ESTIMATED short liquidations (model)</span>
+      <span>{sw("rgba(245,166,35,0.35)", C.amber, false)}OBSERVED liquidation cluster (real orders)</span>
+      <span>{sw("rgba(79,156,255,0.12)", C.blue, true)}Liquidity pool — assumed stop orders</span>
+      <span>{sw("rgba(181,140,255,0.2)", "#B58CFF", true)}Order-book wall (snapshot)</span>
+      <span>● observed liquidation (size = notional)</span>
+      <span>▲▽ sweep/break (filled = confirmed)</span>
+      <span>Stronger zone = more opaque</span>
+    </div>
+  );
+}
+
+function LiqZoneDetail({ z, map, plan, onOpen, narrow }) {
+  const st = liqKindStyle(z);
+  const row = (k, v, col) => <div style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "4px 0", borderBottom: `1px solid ${C.border}`, fontSize: 12.5 }}><span style={{ color: C.textMuted }}>{k}</span><span style={{ fontFamily: mono, color: col || C.text, textAlign: "right" }}>{v}</span></div>;
+  return (
+    <div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 8 }}>
+        <span style={{ fontSize: 10.5, fontWeight: 800, color: st.color, border: `1px solid ${st.color}`, borderRadius: 5, padding: "2px 7px" }}>{z.kind === LIQ_KIND.ESTIMATED ? "ESTIMATED" : z.kind === LIQ_KIND.OBSERVED ? "OBSERVED" : z.kind === LIQ_KIND.LIQUIDITY ? "LIQUIDITY (ASSUMED STOPS)" : "ORDER-BOOK SNAPSHOT"}</span>
+        <b style={{ fontSize: 13 }}>{z.label}</b>
+        <span style={{ fontSize: 11.5, color: C.textMuted }}>{z.dir}</span>
+      </div>
+      {row("Zone range", `${fmtPrice(z.lo)} – ${fmtPrice(z.hi)}`)}
+      {row("Distance from price", z.distAbs === null ? "UNAVAILABLE" : `${fmtPrice(z.distAbs)} (${z.distPct.toFixed(2)}%) ${z.side}`)}
+      {row("Strength (heuristic)", `${z.strength}/100 · max possible with loaded data ${z.maxPossible}`)}
+      {row("Timestamp", liqTime(z.t))}
+      {row("Source", z.source + (z.kind === LIQ_KIND.ESTIMATED ? " — computed model" : z.kind === LIQ_KIND.OBSERVED ? " — Binance public liquidation stream" : z.kind === LIQ_KIND.DEPTH ? " — Binance depth snapshot" : " — derived from confirmed swing highs/lows"))}
+      {row("Invalidation", z.invalidation.text)}
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.04em", margin: "12px 0 6px" }}>Why this strength (inputs & calculation)</div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ borderCollapse: "collapse", fontSize: 11.5, width: "100%" }}>
+          <tbody>
+            {z.comps.map((c) => (
+              <tr key={c.key} style={{ borderTop: `1px solid ${C.border}` }}>
+                <td style={{ padding: "4px 6px", whiteSpace: "nowrap" }}>{c.name}</td>
+                <td style={{ padding: "4px 6px", fontFamily: mono, whiteSpace: "nowrap", color: c.available === false ? C.textDim : C.text }}>{c.available === false ? "n/a" : `${c.points}/${c.max}`}</td>
+                <td style={{ padding: "4px 6px", color: C.textMuted }}>{c.note}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ fontSize: 11.5, color: C.textMuted, lineHeight: 1.5, margin: "10px 0" }}>{z.evidence.map((e, i) => <div key={i}>• {e}</div>)}</div>
+      {plan && plan.scenarios.length > 0 && (
+        <>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.04em", margin: "12px 0 6px" }}>Possible plans — planning aid, never an order</div>
+          <div style={{ display: "grid", gridTemplateColumns: narrow ? "1fr" : "1fr 1fr", gap: 10 }}>
+            {plan.scenarios.map((s) => (
+              <div key={s.name} style={{ background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 4 }}>
+                  <b style={{ fontSize: 12.5 }}>{s.name}</b>
+                  <span style={{ fontSize: 11, fontWeight: 800, color: s.dir === 1 ? C.gain : C.loss }}>{s.side}</span>
+                </div>
+                <div style={{ fontSize: 11, color: s.ready ? C.gain : C.textMuted, marginBottom: 6 }}>{s.ready ? "Trigger already CONFIRMED on a closed candle. " : "Trigger not met: "}{s.trigger}</div>
+                {row("Entry (retest)", fmtPrice(s.entry))}
+                {row("Stop", fmtPrice(s.stop), C.loss)}
+                {s.targets.map((t) => row(`${t.label} · ${t.basis}`, `${fmtPrice(t.price)} · net R:R ${t.rr === null ? "—" : t.rr.toFixed(2)}`, C.gain))}
+                <div style={{ fontSize: 10.5, color: C.textDim, margin: "4px 0" }}>{s.invalidation}. R:R is net of {map.cfg.feePct}% fee and {map.cfg.slippagePct}% slippage per side.</div>
+                {s.warnings.map((w, i) => <div key={i} style={{ fontSize: 11, color: C.amber, lineHeight: 1.4 }}>⚠ {w}</div>)}
+              </div>
+            ))}
+          </div>
+          {plan.warnings.map((w, i) => <div key={i} style={{ fontSize: 11.5, color: /too far|ESTIMATE|cancelled/.test(w) ? C.amber : C.textDim, marginTop: 6, lineHeight: 1.45 }}>⚠ {w}</div>)}
+        </>
+      )}
+      <button type="button" onClick={onOpen} style={{ marginTop: 12, background: C.blue, color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", width: narrow ? "100%" : "auto" }}>Open {z.symbol.replace("USDT", "")} in Analyze with this zone →</button>
+    </div>
+  );
+}
+
+function LiquidityMapTab({ rows, funding, logos, openAnalyze, prefill }) {
+  const scanner = getRadarScanner();
+  const stream = getLiqStream();
+  const [cfg, setCfg] = useState(LIQ_UI_DEFAULTS);
+  const cfgLoaded = useRef(false);
+  const [symbolText, setSymbolText] = useState("BTC");
+  const [eligible, setEligible] = useState([]);
+  const [check, setCheck] = useState(null);
+  const [load, setLoad] = useState({ state: "idle", error: null, src: {} });
+  const [scan, setScan] = useState({ state: "idle", done: 0, total: 0, errors: 0 });
+  const [version, setVersion] = useState(0);
+  const [tick, setTick] = useState(0);
+  const [selectedId, setSelectedId] = useState(null);
+  const [view, setView] = useState({ count: 90, offset: 0, range: "normal" });
+  const [showSettings, setShowSettings] = useState(false);
+  const [showAssump, setShowAssump] = useState(false);
+  const [sort, setSort] = useState({ key: "strength", dir: "desc" });
+  const [tq, setTq] = useState("");
+  const [streamInfo, setStreamInfo] = useState(stream.info());
+  const [narrow, setNarrow] = useState(typeof window !== "undefined" && window.innerWidth < 820);
+  const reqId = useRef(0);
+  const scanId = useRef(0);
+  const bumpTimer = useRef(null);
+  const scanBump = useRef(null);
+  const rowsAt = useRef(Date.now());
+  useEffect(() => { rowsAt.current = Date.now(); }, [rows]);
+  useEffect(() => {
+    const on = () => setNarrow(window.innerWidth < 820);
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, []);
+  useEffect(() => {
+    (async () => {
+      const saved = await safeStorageGet("liq-settings");
+      if (saved) setCfg((c) => ({ ...c, ...saved, layers: { ...c.layers, ...(saved.layers || {}) } }));
+      cfgLoaded.current = true;
+    })();
+  }, []);
+  useEffect(() => { if (cfgLoaded.current) safeStorageSet("liq-settings", cfg); }, [cfg]);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 15000);
+    return () => clearInterval(id);
+  }, []);
+  // live liquidation stream (documented public WebSocket) — keeps running across tab switches
+  useEffect(() => {
+    stream.start();
+    const un = stream.subscribe(() => {
+      if (bumpTimer.current) return;
+      bumpTimer.current = setTimeout(() => { bumpTimer.current = null; setStreamInfo(stream.info()); }, 10000);
+    });
+    setStreamInfo(stream.info());
+    return () => { un(); };
+  }, [stream]);
+  useEffect(() => {
+    if (prefill && prefill.symbol) { setSymbolText(prefill.symbol.replace(/USDT$/, "")); if (prefill.tf && LIQ_TFS.includes(prefill.tf)) setCfg((c) => ({ ...c, tf: prefill.tf })); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill?.n]);
+  const set = (k, v) => setCfg((c) => ({ ...c, [k]: v }));
+  const setLayer = (k) => setCfg((c) => ({ ...c, layers: { ...c.layers, [k]: !c.layers[k] } }));
+
+  const symbol = useMemo(() => normalizeSymbolLiq(symbolText), [symbolText]);
+  const tickerBySymbol = useMemo(() => { const m = {}; rows.forEach((r) => (m[r.symbol] = r)); return m; }, [rows]);
+  const tickerRef = useRef(tickerBySymbol);
+  tickerRef.current = tickerBySymbol;
+  const tf = cfg.tf;
+  const engineSettings = useMemo(() => {
+    const lv = (cfg.leverages && cfg.leverages.length ? cfg.leverages : [10, 25, 50, 100]).map(Number).filter((x) => x >= 2);
+    const w = {};
+    lv.forEach((L) => { w[L] = LIQ_DEFAULTS.leverageWeights[L] ?? 0.15; });
+    return { lookback: Number(cfg.lookback) || 200, leverages: lv, leverageWeights: w, mmr: (Number(cfg.mmr) || 0.5) / 100, minStrength: Number(cfg.minStrength) || 0, feePct: Number(cfg.feePct) || 0, slippagePct: Number(cfg.slippagePct) || 0 };
+  }, [cfg.lookback, cfg.leverages, cfg.mmr, cfg.minStrength, cfg.feePct, cfg.slippagePct]);
+
+  // ---- load the selected symbol (all official public endpoints; failures are reported, never zero-filled)
+  const refresh = useCallback(async (sym, { quiet = false } = {}) => {
+    const my = ++reqId.current;
+    if (!quiet) setLoad((l) => ({ state: "loading", error: null, src: l.src }));
+    let list;
+    try {
+      const info = await scanner.loadExchangeInfo();
+      list = info.symbols;
+      setEligible(list);
+      const chk = symbolCheck(sym, info.statusMap || Object.fromEntries(list.map((s) => [s.symbol, { status: "TRADING", contractType: "PERPETUAL", quoteAsset: "USDT" }])));
+      setCheck(chk);
+      if (my !== reqId.current) return;
+      if (!chk.ok) { setLoad({ state: "invalid", error: chk.reason, src: {} }); return; }
+    } catch (e) {
+      if (my !== reqId.current) return;
+      setLoad((l) => ({ state: l.state === "live" ? "live" : "error", error: "Could not load the Binance contract list: " + String(e && e.message ? e.message : e), src: l.src }));
+      return;
+    }
+    const jobs = {
+      klines: scanner.getKlines(sym, tf),
+      htf4: tf === "4h" ? Promise.resolve() : scanner.getKlines(sym, "4h"),
+      htf1d: tf === "1d" ? Promise.resolve() : scanner.getKlines(sym, "1d"),
+      mark: scanner.getMark(sym),
+      depth: scanner.getDepth(sym),
+      oi: scanner.getDerivExt(sym, tf),
+    };
+    const keys = Object.keys(jobs);
+    const out = await Promise.allSettled(keys.map((k) => jobs[k]));
+    if (my !== reqId.current) return;
+    const src = {};
+    let rl = false;
+    keys.forEach((k, i) => {
+      const r = out[i];
+      if (r.status === "fulfilled") src[k] = { ok: true, at: Date.now() };
+      else { src[k] = { ok: false, err: String(r.reason && r.reason.message ? r.reason.message : r.reason) }; if (r.reason && r.reason.rateLimited) rl = true; }
+    });
+    const klinesOk = src.klines.ok || scanner.hasKlines(sym, [tf]);
+    setLoad({ state: klinesOk ? "live" : "error", error: !klinesOk ? (rl ? `Binance is rate-limiting this connection — retrying in about ${binanceBlockedSecondsLeft() || 60}s.` : "Could not load candles: " + src.klines.err) : rl ? "Binance rate-limited some requests; showing what loaded." : null, src, at: Date.now() });
+    setVersion((v) => v + 1);
+  }, [scanner, tf]);
+  useEffect(() => {
+    if (!symbol) { setLoad({ state: "idle", error: null, src: {} }); setCheck(null); return undefined; }
+    const id = setTimeout(() => refresh(symbol), 350); // debounce rapid symbol/timeframe changes
+    return () => clearTimeout(id);
+  }, [symbol, tf, refresh]);
+  useEffect(() => {
+    if (!symbol || !check || !check.ok || !cfg.refreshSec) return undefined;
+    const id = setInterval(() => refresh(symbol, { quiet: true }), cfg.refreshSec * 1000);
+    return () => clearInterval(id);
+  }, [symbol, check, cfg.refreshSec, refresh]);
+  useEffect(() => { setView((v) => ({ ...v, offset: 0 })); setSelectedId(null); }, [symbol, tf]);
+
+  // ---- market-wide scan for the zone table (candles only; the selected symbol gets the full data)
+  const runScan = useCallback(async () => {
+    const id = ++scanId.current;
+    const cancelled = () => scanId.current !== id;
+    setScan({ state: "scanning", done: 0, total: 0, errors: 0 });
+    try {
+      const info = await scanner.loadExchangeInfo();
+      setEligible(info.symbols);
+      const tk = tickerRef.current;
+      const n = (LIQ_SCOPES.find((s) => s.key === cfg.scope) || LIQ_SCOPES[0]).n;
+      const ordered = orderSymbols(info.symbols.filter((s) => tk[s.symbol]), tk, []).slice(0, n);
+      const r = await scanner.scanKlines(ordered, { tfs: [tf], isCancelled: cancelled, onProgress: (p) => !cancelled() && setScan({ state: "scanning", done: p.done, total: p.total, errors: p.errors }), onSymbol: () => { if (!scanBump.current) scanBump.current = setTimeout(() => { scanBump.current = null; setVersion((v) => v + 1); }, 1500); } });
+      if (cancelled()) return;
+      setScan({ state: "done", done: r.done, total: r.total, errors: r.errors, at: Date.now() });
+      setVersion((v) => v + 1);
+    } catch (e) {
+      if (!cancelled()) setScan({ state: "error", done: 0, total: 0, errors: 0, error: String(e && e.message ? e.message : e) });
+    }
+  }, [scanner, cfg.scope, tf]);
+  const scanStarted = useRef(false);
+  useEffect(() => { if (!scanStarted.current && rows.length > 0) { scanStarted.current = true; runScan(); } }, [rows.length, runScan]);
+  useEffect(() => { if (scanStarted.current && rows.length > 0) runScan(); /* eslint-disable-next-line */ }, [tf, cfg.scope]);
+  useEffect(() => () => { scanId.current++; reqId.current++; }, []);
+
+  // ---- the selected symbol's full map
+  const full = useMemo(() => {
+    if (!symbol || !check || !check.ok || !scanner.hasKlines(symbol, [tf])) return null;
+    const g = scanner.getFrames(symbol, ["4h", "1d", tf]);
+    const mk = scanner.peekMark(symbol);
+    const dp = scanner.peekDepth(symbol);
+    const tk = tickerBySymbol[symbol];
+    const connected = streamInfo.status === "open";
+    const t = Date.now();
+    const map = buildLiquidityMap({
+      symbol, tf, frame: g.frames[tf], frames: g.frames,
+      market: mk ? { ...mk, depth: dp } : dp ? { mark: null, depth: dp } : null,
+      lastPrice: tk ? parseFloat(tk.lastPrice) : null,
+      ext: scanner.peekDerivExt(symbol, tf),
+      observed: connected ? stream.eventsFor(symbol) : null,
+      settings: engineSettings,
+      ages: { [tf]: g.ages[tf], mark: mk ? t - mk.at : undefined },
+      now: t,
+    });
+    return { map, frames: g.frames, frame: g.frames[tf], fetchedAt: g.fetchedAt };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, check, tf, version, tick, engineSettings, streamInfo, tickerBySymbol, scanner]);
+  const map = full && full.map;
+  const selected = map && map.ok ? map.zones.find((z) => z.id === selectedId) || null : null;
+  const plan = useMemo(() => (selected && map ? planForZone(selected, { price: map.price, atr: map.atr, zones: map.zones, frames: full.frames, settings: engineSettings, events: map.events }) : null), [selected, map, full, engineSettings]);
+  const srZones = useMemo(() => (full && full.frame && full.frame.zones ? full.frame.zones.map((z) => ({ lo: z.lo, hi: z.hi })) : []), [full]);
+
+  // ---- cross-symbol zone table
+  const tableRows = useMemo(() => {
+    const out = [];
+    const t = Date.now();
+    const connected = streamInfo.status === "open";
+    eligible.forEach((s) => {
+      if (!scanner.hasKlines(s.symbol, [tf])) return;
+      const tk = tickerBySymbol[s.symbol];
+      let m = null;
+      let tier = "candles + ticker";
+      if (map && map.ok && s.symbol === symbol) { m = map; tier = "full data"; }
+      else {
+        const g = scanner.getFrames(s.symbol, [tf]);
+        m = buildLiquidityMap({ symbol: s.symbol, tf, frame: g.frames[tf], lastPrice: tk ? parseFloat(tk.lastPrice) : null, observed: connected ? stream.eventsFor(s.symbol) : null, settings: engineSettings, ages: { [tf]: g.ages[tf] }, now: t });
+      }
+      if (!m || !m.ok) return;
+      m.zones.forEach((z) => out.push({ z, symbol: s.symbol, base: s.base, price: m.price, tier, stale: m.stale, atr: m.atr }));
+    });
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eligible, version, tick, tf, engineSettings, streamInfo, symbol, map, tickerBySymbol, scanner]);
+  const q = tq.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const filtered = useMemo(() => {
+    const val = (r) => ({ symbol: r.symbol, price: r.price, strength: r.z.strength, dist: r.z.distPct ?? 9999, distAbs: r.z.distAbs ?? 9e9, kind: r.z.kind, time: r.z.t || 0 }[sort.key]);
+    const list = tableRows.filter((r) => {
+      if (q && !r.symbol.includes(q)) return false;
+      if (r.z.strength < cfg.minStrength) return false;
+      if (r.z.distPct !== null && r.z.distPct > cfg.maxDistPct) return false;
+      if (cfg.dirFilter !== "all" && r.z.side !== cfg.dirFilter) return false;
+      if (cfg.kindFilter !== "all" && r.z.kind !== cfg.kindFilter && r.z.source !== cfg.kindFilter) return false;
+      return true;
+    });
+    list.sort((a, b) => { const va = val(a), vb = val(b); const c = typeof va === "string" ? va.localeCompare(vb) : va - vb; return sort.dir === "asc" ? c : -c; });
+    return list;
+  }, [tableRows, q, cfg.minStrength, cfg.maxDistPct, cfg.dirFilter, cfg.kindFilter, sort]);
+
+  const pick = (r) => {
+    setSelectedId(r.z.id);
+    if (r.symbol !== symbol) setSymbolText(r.symbol.replace("USDT", ""));
+  };
+  const openZone = (z, p) => openAnalyze({ symbol: z.symbol, tf: z.tf, zone: z, plan: p, price: map ? map.price : null, at: Date.now() });
+  const observedAll = streamInfo.status === "open" && symbol ? stream.eventsFor(symbol) : null;
+  const ctxn = map && map.ok ? map.context : null;
+  const inputS = { ...selStyle(), width: "100%", padding: "8px 10px", fontSize: 13, boxSizing: "border-box" };
+  const sortHdr = (key, label) => <th onClick={() => setSort((s) => ({ key, dir: s.key === key && s.dir === "desc" ? "asc" : "desc" }))} style={{ padding: "6px 8px", textAlign: "left", fontSize: 10.5, color: C.textDim, textTransform: "uppercase", cursor: "pointer", whiteSpace: "nowrap" }}>{label}{sort.key === key ? (sort.dir === "desc" ? " ▼" : " ▲") : ""}</th>;
+  const stat = (label, value, sub, color) => (
+    <div style={{ background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: "9px 11px", minWidth: 0 }}>
+      <div style={{ fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 3 }}>{label}</div>
+      <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, color: color || C.text, overflowWrap: "anywhere" }}>{value}</div>
+      {sub && <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+  const srcChip = (name, s) => (
+    <span key={name} style={{ fontSize: 10, border: `1px solid ${s ? (s.ok ? C.gain : C.amber) : C.border}`, color: s ? (s.ok ? C.gain : C.amber) : C.textDim, borderRadius: 4, padding: "1px 5px" }} title={s && !s.ok ? s.err : ""}>
+      {name}: {s ? (s.ok ? "OK" : "UNAVAILABLE") : "—"}
+    </span>
+  );
+
+  return (
+    <div style={{ maxWidth: 1180, margin: "0 auto" }}>
+      <Card title="Liquidation Heatmap & Liquidity Zones">
+        <div style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>
+          Binance publishes <b>no</b> map of traders' liquidation prices. <b>Estimated</b> zones are a model: where positions opened near past swing and volume prices would be liquidated at assumed leverage — every assumption is listed below. <b>Observed</b> clusters are real liquidation orders received from Binance's public stream <i>since this page was opened</i>. <b>Liquidity pools</b> are places stop orders are <i>assumed</i> to rest, not liquidation clusters. Strengths are heuristic rankings, not probabilities, and nothing is traded for you.
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: narrow ? "1fr" : "minmax(220px, 1.3fr) auto auto auto", gap: 10, alignItems: "end", marginBottom: 10 }}>
+          <Field label="Pair (BTC, BTCUSDT, BTC/USDT, btc usdt)">
+            <SymbolPicker rows={rows} logos={logos} value={symbolText} onChange={setSymbolText} onSelect={(s) => setSymbolText(s.replace("USDT", ""))} placeholder="Pair — tap to browse" />
+          </Field>
+          <Field label="Timeframe">
+            <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>{LIQ_TFS.map((t) => <button key={t} type="button" onClick={() => set("tf", t)} style={liqPill(tf === t)}>{t}</button>)}</div>
+          </Field>
+          <Field label="Lookback (candles)">
+            <select value={cfg.lookback} onChange={(e) => set("lookback", Number(e.target.value))} style={{ ...selStyle(), width: "100%", padding: "8px 10px" }}>{LIQ_LOOKBACKS.map((n) => <option key={n} value={n}>{n}</option>)}</select>
+          </Field>
+          <Field label="Refresh">
+            <select value={cfg.refreshSec} onChange={(e) => set("refreshSec", Number(e.target.value))} style={{ ...selStyle(), width: "100%", padding: "8px 10px" }}>{LIQ_REFRESH.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select>
+          </Field>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+          <button type="button" onClick={() => symbol && refresh(symbol)} style={liqPill(false)}>Refresh now</button>
+          <button type="button" onClick={() => setShowSettings((v) => !v)} style={liqPill(showSettings)}>Settings</button>
+          <button type="button" onClick={() => setShowAssump((v) => !v)} style={liqPill(showAssump)}>Assumptions</button>
+          <span style={{ fontSize: 11, color: C.textMuted }}>
+            {load.state === "loading" && "Loading…"}
+            {load.state === "live" && `Updated ${fmtClock(load.at)}`}
+            {load.state === "idle" && "Enter a pair."}
+          </span>
+        </div>
+        {showSettings && (
+          <div style={{ background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, marginTop: 10, display: "grid", gridTemplateColumns: narrow ? "1fr 1fr" : "repeat(4, 1fr)", gap: 10 }}>
+            <Field label="Min strength"><input type="number" min="0" max="100" value={cfg.minStrength} onChange={(e) => set("minStrength", Number(e.target.value))} style={inputS} /></Field>
+            <Field label="Max distance %"><input type="number" min="0" step="1" value={cfg.maxDistPct} onChange={(e) => set("maxDistPct", Number(e.target.value))} style={inputS} /></Field>
+            <Field label="Maintenance margin % (assumed)"><input type="number" min="0.1" step="0.1" value={cfg.mmr} onChange={(e) => set("mmr", Number(e.target.value))} style={inputS} /></Field>
+            <Field label="Symbols in table"><select value={cfg.scope} onChange={(e) => set("scope", e.target.value)} style={{ ...selStyle(), width: "100%", padding: "8px 10px" }}>{LIQ_SCOPES.map((s) => <option key={s.key} value={s.key}>Top {s.key} by volume</option>)}</select></Field>
+            <Field label="Fee % per side"><input type="number" min="0" step="0.01" value={cfg.feePct} onChange={(e) => set("feePct", Number(e.target.value))} style={inputS} /></Field>
+            <Field label="Slippage % per side"><input type="number" min="0" step="0.01" value={cfg.slippagePct} onChange={(e) => set("slippagePct", Number(e.target.value))} style={inputS} /></Field>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <div style={{ fontSize: 10.5, color: C.textDim, marginBottom: 5, textTransform: "uppercase" }}>Assumed leverage tiers (a guess — real positioning is not public)</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {[5, 10, 25, 50, 100].map((L) => { const on = cfg.leverages.includes(L); return <button key={L} type="button" onClick={() => set("leverages", on ? cfg.leverages.filter((x) => x !== L) : [...cfg.leverages, L].sort((a, b) => a - b))} style={liqPill(on)}>{L}x</button>; })}
+                <button type="button" onClick={() => setCfg(LIQ_UI_DEFAULTS)} style={liqPill(false)}>Reset all</button>
+              </div>
+            </div>
+          </div>
+        )}
+        {showAssump && map && map.ok && (
+          <div style={{ background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, marginTop: 10, fontSize: 11.5, color: C.textMuted, lineHeight: 1.55 }}>
+            <b style={{ color: C.text }}>How the estimate is built</b>
+            {map.assumptions.map((a, i) => <div key={i}>• {a}</div>)}
+          </div>
+        )}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10, alignItems: "center" }}>
+          {["klines", "mark", "depth", "oi"].map((k) => srcChip({ klines: "Candles", mark: "Mark price", depth: "Order book", oi: "OI/funding" }[k], load.src[k]))}
+          <span style={{ fontSize: 10, border: `1px solid ${streamInfo.status === "open" ? C.gain : C.amber}`, color: streamInfo.status === "open" ? C.gain : C.amber, borderRadius: 4, padding: "1px 5px" }}>
+            Liquidation stream: {streamInfo.status === "open" ? `LIVE · ${streamInfo.total} orders since ${fmtClock(streamInfo.startedAt)}` : streamInfo.status === "unsupported" ? "NOT SUPPORTED in this browser" : streamInfo.status.toUpperCase()}
+          </span>
+        </div>
+      </Card>
+
+      {load.state === "invalid" && <div style={{ border: `1px solid ${C.loss}`, background: C.lossBg, color: C.loss, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, marginBottom: 14 }}>{load.error}</div>}
+      {load.error && load.state !== "invalid" && <div style={{ border: `1px solid ${C.amber}`, background: "rgba(245,166,35,0.1)", color: C.amber, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, marginBottom: 14 }}>{load.error}</div>}
+      {load.state === "loading" && !map && <div style={{ fontSize: 12.5, color: C.textMuted, padding: "6px 2px 14px" }}>Loading candles, mark price, order book and open interest from Binance…</div>}
+      {map && !map.ok && (
+        <Card title="Zones"><span style={{ display: "inline-block", padding: "4px 9px", borderRadius: 6, fontSize: 11.5, fontWeight: 800, color: map.state === "STALE" ? C.amber : C.textMuted, background: C.panelAlt }}>{map.state === "STALE" ? "DATA STALE" : "INSUFFICIENT DATA"}</span><div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 8 }}>{map.reason}. Nothing is estimated when data is missing.</div></Card>
+      )}
+
+      {map && map.ok && (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: narrow ? "1fr 1fr" : "repeat(4, 1fr)", gap: 8, marginBottom: 14 }}>
+            {stat(map.priceSource.startsWith("OFFICIAL mark") ? "Mark price" : "Price", fmtPrice(map.price), map.priceSource, map.stale ? C.amber : C.text)}
+            {stat("Nearest zone above", map.nearest.above ? `${fmtPrice(map.nearest.above.lo)}` : "none", map.nearest.above ? `${map.nearest.above.distPct.toFixed(2)}% · ${liqShort(map.nearest.above)} · ${map.nearest.above.strength}` : "no zone above price", C.gain)}
+            {stat("Nearest zone below", map.nearest.below ? `${fmtPrice(map.nearest.below.hi)}` : "none", map.nearest.below ? `${map.nearest.below.distPct.toFixed(2)}% · ${liqShort(map.nearest.below)} · ${map.nearest.below.strength}` : "no zone below price", C.loss)}
+            {stat("Funding", ctxn.funding === null ? "UNAVAILABLE" : (ctxn.funding * 100).toFixed(4) + "%", ctxn.nextFundingTime ? `next ${fmtClock(ctxn.nextFundingTime)}` : "OFFICIAL")}
+            {stat(`Open interest (${tf} periods)`, ctxn.oiChg === null ? "UNAVAILABLE" : (ctxn.oiChg >= 0 ? "+" : "") + ctxn.oiChg.toFixed(2) + "%", ctxn.oiChg3 === null ? "history not loaded" : `${ctxn.oiChg3 >= 0 ? "+" : ""}${ctxn.oiChg3.toFixed(2)}% last 3`)}
+            {stat("Volume", ctxn.relVol === null || ctxn.relVol === undefined ? "UNAVAILABLE" : ctxn.relVol.toFixed(1) + "× avg", `24h ≈ ${fmtVol(ctxn.volume24h)}`)}
+            {stat("Taker buy share", ctxn.takerShare === null ? "UNAVAILABLE" : (ctxn.takerShare * 100).toFixed(0) + "%", "last closed candle (kline field)")}
+            {stat("ATR", ctxn.atrPct.toFixed(2) + "%", `4H trend: ${ctxn.trend4h ? ctxn.trend4h.label : "UNAVAILABLE"}`)}
+          </div>
+          {map.flags.length > 0 && <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>{map.flags.map((f) => <span key={f} style={{ fontSize: 9.5, color: C.amber, border: `1px solid ${C.amber}`, borderRadius: 4, padding: "0 5px" }}>{f}</span>)}</div>}
+
+          <Card title={`${symbol.replace("USDT", "/USDT")} · ${tf} heatmap`} right={<span style={{ fontSize: 10.5, color: C.textDim }}>{map.zones.length} zones · {map.levelsCount} modelled levels</span>}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+              {LIQ_LAYERS.map(([k, l]) => <button key={k} type="button" onClick={() => setLayer(k)} style={liqPill(cfg.layers[k])}>{l}</button>)}
+            </div>
+            <LiqChart map={map} frame={full.frame} layers={cfg.layers} view={view} setView={setView} selectedId={selectedId} onSelect={setSelectedId} observed={observedAll} srZones={srZones} />
+            <LiqLegend />
+          </Card>
+
+          {selected ? (
+            <Card title="Zone details" right={<button type="button" onClick={() => setSelectedId(null)} style={liqPill(false)}>Close</button>}>
+              <LiqZoneDetail z={selected} map={map} plan={plan} onOpen={() => openZone(selected, plan)} narrow={narrow} />
+            </Card>
+          ) : (
+            <div style={{ fontSize: 12, color: C.textDim, margin: "0 2px 14px" }}>Tap a band on the chart, or a row below, to see its inputs, calculation, invalidation and possible plans.</div>
+          )}
+
+          <Card title={`Sweeps, breaks & squeezes (${map.events.length})`}>
+            {map.events.length === 0 ? <div style={{ fontSize: 12.5, color: C.textMuted }}>No sweep, hold or false-breakout events in the last {map.cfg.eventBars} candles. A quiet chart is a valid result.</div> : map.events.map((e, i) => (
+              <div key={i} style={{ borderTop: i ? `1px solid ${C.border}` : "none", padding: "8px 0" }}>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                  <span style={{ fontSize: 10.5, fontWeight: 800, color: e.state === "CONFIRMED" ? "#0B1A12" : C.amber, background: e.state === "CONFIRMED" ? C.gain : "rgba(245,166,35,0.14)", borderRadius: 5, padding: "2px 7px" }}>{e.state}</span>
+                  <b style={{ fontSize: 12.5 }}>{e.type}</b>
+                  <span style={{ fontSize: 11, color: C.textDim, fontFamily: mono }}>level {fmtPrice(e.level)} · {e.barsAgo >= 0 ? `${e.barsAgo} candle(s) ago` : "now"} · {liqTime(e.t)}</span>
+                </div>
+                <div style={{ fontSize: 11.5, color: C.textMuted, lineHeight: 1.5, marginTop: 4 }}>{e.implication}</div>
+                {e.evidence.map((x, j) => <div key={j} style={{ fontSize: 11.5, lineHeight: 1.45 }}>✓ {x}</div>)}
+                {e.conflicting.map((x, j) => <div key={j} style={{ fontSize: 11.5, lineHeight: 1.45, color: C.amber }}>✗ {x}</div>)}
+              </div>
+            ))}
+            {map.assess && (map.assess.squeeze || map.assess.cascade) && (
+              <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 8, lineHeight: 1.5 }}>
+                {map.assess.squeeze && <div>Short squeeze: {map.assess.squeeze}</div>}
+                {map.assess.cascade && <div>Long-liquidation cascade: {map.assess.cascade}</div>}
+              </div>
+            )}
+            <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 8, lineHeight: 1.5 }}>Sweeps use candle closes, wicks, volume and ATR. Squeezes and cascades are never inferred from price alone: they need falling open interest or observed liquidation orders, and are only CONFIRMED by observed liquidations.</div>
+          </Card>
+        </>
+      )}
+
+      <Card title={`Zones across the market (${filtered.length})`} right={<span style={{ fontSize: 10.5, color: C.textDim }}>{scan.state === "scanning" ? `scanning ${scan.done}/${scan.total}` : scan.state === "done" ? `${scan.done} symbols · ${fmtClock(scan.at)}` : scan.state === "error" ? "scan failed" : ""}</span>}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+          <input value={tq} onChange={(e) => setTq(e.target.value)} placeholder="Filter symbol…" style={{ ...selStyle(), flex: "1 1 130px", minWidth: 0, fontSize: 13, padding: "8px 10px" }} />
+          <select value={cfg.dirFilter} onChange={(e) => set("dirFilter", e.target.value)} style={selStyle()}><option value="all">Above & below</option><option value="above">Above price</option><option value="below">Below price</option></select>
+          <select value={cfg.kindFilter} onChange={(e) => set("kindFilter", e.target.value)} style={selStyle()}>
+            <option value="all">All data sources</option><option value={LIQ_KIND.ESTIMATED}>Estimated</option><option value={LIQ_KIND.OBSERVED}>Observed</option><option value={LIQ_KIND.LIQUIDITY}>Liquidity pools</option><option value={LIQ_KIND.DEPTH}>Order-book walls</option>
+          </select>
+          {narrow && (
+            <select value={`${sort.key}|${sort.dir}`} onChange={(e) => { const [k, d] = e.target.value.split("|"); setSort({ key: k, dir: d }); }} style={selStyle()}>
+              <option value="strength|desc">Sort: strength</option><option value="dist|asc">Sort: nearest</option><option value="symbol|asc">Sort: symbol</option><option value="time|desc">Sort: newest</option>
+            </select>
+          )}
+        </div>
+        {tableRows.length === 0 && <div style={{ fontSize: 12.5, color: C.textMuted }}>{scan.state === "scanning" ? "Scanning candles…" : "No zones yet."}</div>}
+        {narrow ? (
+          filtered.slice(0, 80).map((r) => {
+            const st = liqKindStyle(r.z);
+            return (
+              <div key={r.z.id} role="button" tabIndex={0} onClick={() => pick(r)} style={{ border: `1px solid ${r.z.id === selectedId ? C.blue : C.border}`, borderLeft: `3px solid ${st.color}`, borderRadius: 8, padding: 10, marginBottom: 8, cursor: "pointer" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}><b>{r.base}<span style={{ color: C.textDim, fontWeight: 500 }}>/USDT</span></b><span style={{ fontFamily: mono, fontWeight: 800 }}>{r.z.strength}<span style={{ fontSize: 9.5, color: C.textDim }}>/100</span></span></div>
+                <div style={{ fontSize: 11.5, color: C.textMuted, fontFamily: mono }}>{fmtPrice(r.price)} → {fmtPrice(r.z.lo)}–{fmtPrice(r.z.hi)} · {r.z.distPct === null ? "—" : r.z.distPct.toFixed(2) + "%"} {r.z.side}</div>
+                <div style={{ fontSize: 11, marginTop: 3 }}><span style={{ color: st.color, fontWeight: 800 }}>{st.tag}</span> · {r.z.dir} <span style={{ color: C.textDim }}>· {r.tier}</span></div>
+                <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 3, lineHeight: 1.4 }}>{r.z.evidence[0]}</div>
+                <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 2 }}>{liqTime(r.z.t)} · invalid: {r.z.invalidation.text}</div>
+              </div>
+            );
+          })
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12 }}>
+              <thead><tr style={{ borderBottom: `1px solid ${C.border}` }}>{sortHdr("symbol", "Symbol")}{sortHdr("price", "Price")}<th style={{ padding: "6px 8px", textAlign: "left", fontSize: 10.5, color: C.textDim }}>ZONE RANGE</th>{sortHdr("dist", "Distance")}<th style={{ padding: "6px 8px", textAlign: "left", fontSize: 10.5, color: C.textDim }}>DIRECTION</th>{sortHdr("kind", "Type")}{sortHdr("strength", "Strength")}<th style={{ padding: "6px 8px", textAlign: "left", fontSize: 10.5, color: C.textDim }}>EVIDENCE</th>{sortHdr("time", "Time")}<th style={{ padding: "6px 8px", textAlign: "left", fontSize: 10.5, color: C.textDim }}>INVALIDATION</th></tr></thead>
+              <tbody>
+                {filtered.slice(0, 120).map((r) => {
+                  const st = liqKindStyle(r.z);
+                  return (
+                    <tr key={r.z.id} onClick={() => pick(r)} style={{ borderTop: `1px solid ${C.border}`, cursor: "pointer", background: r.z.id === selectedId ? C.panelAlt : "transparent" }}>
+                      <td style={{ padding: "6px 8px", fontWeight: 700 }}>{r.base}<span style={{ color: C.textDim, fontWeight: 400 }}>/USDT</span></td>
+                      <td style={{ padding: "6px 8px", fontFamily: mono }}>{fmtPrice(r.price)}</td>
+                      <td style={{ padding: "6px 8px", fontFamily: mono, whiteSpace: "nowrap" }}>{fmtPrice(r.z.lo)}–{fmtPrice(r.z.hi)}</td>
+                      <td style={{ padding: "6px 8px", fontFamily: mono, whiteSpace: "nowrap" }}>{r.z.distAbs === null ? "—" : `${fmtPrice(r.z.distAbs)} · ${r.z.distPct.toFixed(2)}% ${r.z.side === "above" ? "▲" : r.z.side === "below" ? "▼" : "●"}`}</td>
+                      <td style={{ padding: "6px 8px" }}>{r.z.dir}</td>
+                      <td style={{ padding: "6px 8px" }}><span style={{ color: st.color, fontWeight: 800, fontSize: 10.5 }}>{st.tag}</span><div style={{ fontSize: 10, color: C.textDim }}>{r.tier}</div></td>
+                      <td style={{ padding: "6px 8px", fontFamily: mono, fontWeight: 800 }}>{r.z.strength}</td>
+                      <td style={{ padding: "6px 8px", color: C.textMuted, maxWidth: 260 }}>{r.z.evidence[0]}</td>
+                      <td style={{ padding: "6px 8px", fontFamily: mono, whiteSpace: "nowrap", color: C.textDim }}>{liqTime(r.z.t)}</td>
+                      <td style={{ padding: "6px 8px", color: C.textDim, maxWidth: 220 }}>{r.z.invalidation.text}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 8, lineHeight: 1.5 }}>Rows for other symbols use candles and the 24h ticker only (labelled “candles + ticker”); select a symbol for mark price, order book, open interest and funding. Zones are never labelled as liquidation clusters unless they are ESTIMATED (model) or OBSERVED (real orders).</div>
+      </Card>
+      <div style={{ fontSize: 10.5, color: C.textDim, lineHeight: 1.5, padding: "0 4px 20px" }}>
+        Sources: Binance USDⓈ-M public endpoints only — exchangeInfo, klines, premiumIndex (mark price, funding), depth, openInterestHist, fundingRate, and the public <code>!forceOrder@arr</code> liquidation stream. No API keys, no private accounts, no scraped or third-party heatmap data. <SrcTag kind="OFFICIAL" /> read directly · <SrcTag kind="DERIVED" /> calculated · <SrcTag kind="INFERRED" /> estimated · <SrcTag kind="UNAVAILABLE" /> missing — never replaced by zero.
+      </div>
+    </div>
+  );
+}
+function normalizeSymbolLiq(s) { return normalizeSymbol(s || ""); }
+
 function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrades, setSavedTrades, logos, goToTrades, prefill }) {
   const [section, setSection] = useState("setup"); // setup | deep | smart
   const [justTracked, setJustTracked] = useState(null); // symbol just added to Trades
@@ -5269,6 +5976,7 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
           logos={logos}
           symbolText={form.symbol}
           setSymbolText={(v) => setForm((f) => ({ ...f, symbol: v, entry: "" }))}
+          overlay={prefill && prefill.overlay}
         />
       )}
 
