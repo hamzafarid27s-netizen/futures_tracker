@@ -71,6 +71,7 @@ export function parseCandles(raw) {
       v: parseFloat(k[5]),
       ct: Number(k[6]),
       qv: parseFloat(k[7]),
+      tb: k.length > 9 ? parseFloat(k[9]) : NaN, // taker buy base volume (official kline field), NaN when absent
     };
     const ok =
       [c.t, c.o, c.h, c.l, c.c, c.ct].every(isNum) &&
@@ -82,6 +83,7 @@ export function parseCandles(raw) {
     }
     if (!isNum(c.v) || c.v < 0) c.v = 0;
     if (!isNum(c.qv) || c.qv < 0) c.qv = 0;
+    if (!isNum(c.tb) || c.tb < 0 || c.tb > c.v * 1.0001) c.tb = null; // missing/invalid -> UNAVAILABLE, never 0
     out.push(c);
   }
   out.sort((a, b) => a.t - b.t);

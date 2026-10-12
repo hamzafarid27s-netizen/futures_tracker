@@ -76,7 +76,7 @@ export function createRadarScanner(deps) {
   } = deps;
   const spent = []; // [timestamp, weight] of recent radar requests
 
-  const cache = { exchange: null, book: null, klines: new Map(), deriv: new Map() };
+  const cache = { exchange: null, book: null, klines: new Map(), deriv: new Map(), derivExt: new Map() };
   const inflight = new Map();
   const stats = { requests: 0, retries: 0, rateLimited: 0, dedupHits: 0 };
 
@@ -235,6 +235,49 @@ export function createRadarScanner(deps) {
     });
   }
 
+  // ------------------------------------------- extended derivatives (per timeframe)
+  // OI history, global long/short account ratio, taker buy/sell volume ratio (all
+  // documented public /futures/data endpoints) and funding-rate history.
+  // Anything that fails is left null and listed in `errors` — never filled with 0.
+  const DERIV_PERIODS = new Set(["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]);
+  async function getDerivExt(symbol, period = "1h", { force = false } = {}) {
+    if (!DERIV_PERIODS.has(period)) throw new Error("Unsupported period " + period);
+    const key = `${symbol}|${period}`;
+    const hit = cache.derivExt.get(key);
+    if (!force && hit && now() - hit.at < DERIV_TTL) return hit.data;
+    return dedupe("x:" + key, async () => {
+      const s = encodeURIComponent(symbol);
+      const q = `symbol=${s}&period=${period}&limit=30`;
+      const [oi, ls, tk, fr] = await Promise.allSettled([
+        request(`${base}/futures/data/openInterestHist?${q}`, 1),
+        request(`${base}/futures/data/globalLongShortAccountRatio?${q}`, 1),
+        request(`${base}/futures/data/takerlongshortRatio?${q}`, 1),
+        request(`${base}/fapi/v1/fundingRate?symbol=${s}&limit=12`, 1),
+      ]);
+      const num = (x) => {
+        const v = parseFloat(x);
+        return Number.isFinite(v) ? v : null;
+      };
+      const out = { period, oi: null, ls: null, taker: null, funding: null, errors: [], fetchedAt: now() };
+      const take = (res, name, map) => {
+        if (res.status === "fulfilled" && Array.isArray(res.value) && res.value.length) {
+          const rows = res.value.map(map).filter((r) => r && r.t !== null);
+          if (rows.length) return rows.sort((a, b) => a.t - b.t);
+        }
+        out.errors.push(name + ": " + (res.status === "rejected" ? res.reason?.message || "failed" : "no data"));
+        return null;
+      };
+      out.oi = take(oi, "open interest", (r) => ({ t: num(r.timestamp), v: num(r.sumOpenInterestValue), c: num(r.sumOpenInterest) }));
+      out.ls = take(ls, "long/short ratio", (r) => ({ t: num(r.timestamp), ratio: num(r.longShortRatio), long: num(r.longAccount), short: num(r.shortAccount) }));
+      out.taker = take(tk, "taker volume", (r) => ({ t: num(r.timestamp), ratio: num(r.buySellRatio), buy: num(r.buyVol), sell: num(r.sellVol) }));
+      out.funding = take(fr, "funding history", (r) => ({ t: num(r.fundingTime), rate: num(r.fundingRate) }));
+      const limited = [oi, ls, tk, fr].find((x) => x.status === "rejected" && x.reason && x.reason.rateLimited);
+      if (limited && !out.oi && !out.ls && !out.taker && !out.funding) throw limited.reason;
+      cache.derivExt.set(key, { at: now(), data: out });
+      return out;
+    });
+  }
+
   // ----------------------------------------------------- scanning (worker pool)
   // Runs `task` over `items` with at most `concurrency` in flight. A failure in
   // one item never stops the others.
@@ -356,6 +399,9 @@ export function createRadarScanner(deps) {
 
   return {
     getFrames,
+    getDerivExt,
+    hasDerivExt: (symbol, period) => cache.derivExt.has(`${symbol}|${period}`),
+    peekDerivExt: (symbol, period) => cache.derivExt.get(`${symbol}|${period}`)?.data || null,
     loadExchangeInfo,
     loadBook,
     getKlines,
@@ -368,6 +414,7 @@ export function createRadarScanner(deps) {
     clear: () => {
       cache.klines.clear();
       cache.deriv.clear();
+      cache.derivExt.clear();
       cache.book = null;
     },
     stats,

@@ -3,6 +3,7 @@ import { supabase, isBackgroundAlertsConfigured } from "./supabaseClient";
 import { analyzeCandles, MIN_ANALYSIS_CANDLES } from "./deepAnalysis";
 import { createRadarScanner, orderSymbols } from "./radarScanner";
 import { STATUS, DEFAULT_SETTINGS } from "./entryRadar";
+import { evaluateReversal, createSignalLog, normalizeSymbol, REV_STATE, REV_TFS, REV_DEFAULTS, FLOW } from "./reversal";
 import { evaluateSmartEntry, positionSize, symbolCheck, SMART_STATUS, SMART_DEFAULTS, NO_VALID_ZONE } from "./smartEntry";
 
 const DARK_THEME = {
@@ -358,6 +359,7 @@ export default function FuturesTracker() {
   const [newAlertForm, setNewAlertForm] = useState({ symbol: "", min: 60, pct: 5, dir: "either" });
   const [analyzeSymbol, setAnalyzeSymbol] = useState(null);
   const [analyzePrefill, setAnalyzePrefill] = useState(null); // symbol sent from Entry Radar
+  const openAnalyzeFromReversal = (sym, tf) => { setAnalyzePrefill({ symbol: sym, n: Date.now(), section: "deep", tf }); setTab("analyze"); };
   const openAnalyzeFromRadar = (sym) => { setAnalyzePrefill({ symbol: sym, n: Date.now(), section: "smart" }); setTab("analyze"); };
   const [coinLogos, setCoinLogos] = useState({});
   const [savedTrades, setSavedTrades] = useState([]); // {id, symbol, entry, margin, leverage, dir, roiAlerts:[{id,pct}], pnlAlerts:[{id,value}]}
@@ -1671,7 +1673,7 @@ export default function FuturesTracker() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${C.border}`, overflowX: "auto" }}>
-          {["market", "analyze", "trades", "screener", "radar", "alerts"].map((t) => (
+          {["market", "analyze", "trades", "screener", "radar", "reversal", "alerts"].map((t) => (
             <div
               key={t}
               className="ft-tab"
@@ -1687,7 +1689,7 @@ export default function FuturesTracker() {
                 whiteSpace: "nowrap",
               }}
             >
-              {t === "radar" ? "Entry Radar" : t === "alerts" && triggered.length > 0
+              {t === "radar" ? "Entry Radar" : t === "reversal" ? "Early Reversal" : t === "alerts" && triggered.length > 0
                 ? `Alerts · ${triggered.length}`
                 : t === "trades" && savedTrades.length > 0
                 ? `Trades · ${savedTrades.length}`
@@ -1868,6 +1870,9 @@ export default function FuturesTracker() {
           />
         )}
 
+        {tab === "reversal" && (
+          <EarlyReversalTab rows={rows} funding={funding} logos={coinLogos} openAnalyze={openAnalyzeFromReversal} />
+        )}
         {tab === "radar" && (
           <EntryRadarTab rows={rows} funding={funding} logos={coinLogos} openAnalyze={openAnalyzeFromRadar} />
         )}
@@ -4256,6 +4261,743 @@ function SmartEntryPanel({ rows, funding, logos, symbolText, setSymbolText }) {
   );
 }
 
+// =====================================================================
+// EARLY REVERSAL & LARGE-PLAYER ACTIVITY — analysis lives in reversal.js,
+// data fetching in radarScanner.js. Scores are heuristic rankings, not
+// probabilities. Large-player labels are INFERENCES from public data.
+// =====================================================================
+const REV_SCOPES = [
+  { key: "30", label: "Top 30 by volume", n: 30 },
+  { key: "60", label: "Top 60 by volume", n: 60 },
+  { key: "100", label: "Top 100 by volume", n: 100 },
+  { key: "200", label: "Top 200 by volume", n: 200 },
+];
+const REV_UI_DEFAULTS = { scope: "30", minScore: 40, minVolume: 10_000_000, autoRefresh: true, volSpike: 2.0, breakVol: 1.5, breakAtr: 0.15, earlyMin: 40, confirmMin: 60 };
+const REV_SORTS = [
+  ["priority", "Signal priority"], ["bull", "Bullish score"], ["bear", "Bearish score"], ["agree", "Timeframe agreement"], ["volume", "24h volume"], ["change", "24h change"], ["symbol", "Symbol A–Z"], ["recent", "Newest candle"],
+];
+const REV_STATE_FILTERS = ["all", ...Object.values(REV_STATE)];
+const REV_DERIV_TFS = ["15m", "1h"]; // timeframes whose OI / ratio data is fetched for the top candidates
+
+function revStateStyle(state) {
+  switch (state) {
+    case REV_STATE.BULL_CONF: return { color: "#0B1A12", bg: C.gain };
+    case REV_STATE.BEAR_CONF: return { color: "#1D0B0B", bg: C.loss };
+    case REV_STATE.BREAKOUT: return { color: "#0B1A12", bg: C.gain };
+    case REV_STATE.BREAKDOWN: return { color: "#1D0B0B", bg: C.loss };
+    case REV_STATE.EARLY_BULL: case REV_STATE.POT_BREAKOUT: return { color: C.gain, bg: C.gainBg };
+    case REV_STATE.EARLY_BEAR: case REV_STATE.POT_BREAKDOWN: return { color: C.loss, bg: C.lossBg };
+    case REV_STATE.FALSE_RISK: return { color: C.amber, bg: "rgba(245,166,35,0.14)" };
+    default: return { color: C.textDim, bg: "transparent" };
+  }
+}
+const revPriority = (s) => ({ [REV_STATE.BULL_CONF]: 9, [REV_STATE.BEAR_CONF]: 9, [REV_STATE.BREAKOUT]: 7, [REV_STATE.BREAKDOWN]: 7, [REV_STATE.EARLY_BULL]: 6, [REV_STATE.EARLY_BEAR]: 6, [REV_STATE.POT_BREAKOUT]: 4, [REV_STATE.POT_BREAKDOWN]: 4, [REV_STATE.FALSE_RISK]: 3, [REV_STATE.NONE]: 1 }[s] || 0);
+const revSide = (state) => ([REV_STATE.EARLY_BULL, REV_STATE.BULL_CONF, REV_STATE.BREAKOUT, REV_STATE.POT_BREAKOUT].includes(state) ? 1 : [REV_STATE.EARLY_BEAR, REV_STATE.BEAR_CONF, REV_STATE.BREAKDOWN, REV_STATE.POT_BREAKDOWN].includes(state) ? -1 : 0);
+
+function SrcTag({ kind }) {
+  const col = kind === "OFFICIAL" ? C.gain : kind === "DERIVED" ? C.blue : kind === "INFERRED" ? C.amber : C.textDim;
+  return (
+    <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.04em", color: col, border: `1px solid ${col}`, borderRadius: 4, padding: "0 4px", marginLeft: 5, whiteSpace: "nowrap", opacity: 0.9 }}>{kind}</span>
+  );
+}
+
+function RevBadge({ state, provisional }) {
+  const st = revStateStyle(state);
+  return (
+    <span style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: "0.03em", color: st.color, background: st.bg, border: st.bg === "transparent" ? `1px solid ${C.border}` : "none", borderRadius: 5, padding: "2px 7px", whiteSpace: "nowrap" }}>
+      {state}{provisional ? " · LIVE (unconfirmed)" : ""}
+    </span>
+  );
+}
+
+function ScoreBar({ label, score, color, max }) {
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 2 }}>
+        <span style={{ color: C.textMuted }}>{label}</span>
+        <span style={{ fontFamily: mono, fontWeight: 700, color }}>{score}<span style={{ color: C.textDim, fontWeight: 400 }}>/100{max !== undefined && max < 100 ? ` · max possible ${max} with loaded data` : ""}</span></span>
+      </div>
+      <div style={{ height: 7, background: C.panelAlt, borderRadius: 4, overflow: "hidden", position: "relative" }}>
+        <div style={{ width: `${Math.max(0, Math.min(100, score))}%`, height: "100%", background: color, borderRadius: 4 }} />
+        {max !== undefined && max < 100 && <div style={{ position: "absolute", left: `${max}%`, top: 0, bottom: 0, width: 1, background: C.textDim }} />}
+      </div>
+    </div>
+  );
+}
+
+function RevChart({ chart, price, invalidation, tf }) {
+  if (!chart || !chart.candles || chart.candles.length < 10) {
+    return <div style={{ fontSize: 12, color: C.textMuted, padding: 12 }}>Chart UNAVAILABLE — not enough {String(tf).toUpperCase()} candles.</div>;
+  }
+  const W = 720, H = 340, padL = 8, padR = 78, padT = 12, padB = 26;
+  const candles = [...chart.candles];
+  if (chart.forming) candles.push({ ...chart.forming, forming: true });
+  const nC = candles.length;
+  const lines = [];
+  (chart.breakLevels || []).forEach((b) => lines.push({ p: b.level, c: b.dir === 1 ? C.gain : C.loss, d: "6 3", label: b.label }));
+  if (isFinite(invalidation) && invalidation !== null) lines.push({ p: invalidation, c: "#FF9F5C", d: "2 3", label: "Invalidation" });
+  const emaVals = [chart.ema20, chart.ema50, chart.ema200].flatMap((a) => (a || []).filter((v) => typeof v === "number"));
+  const vals = candles.flatMap((c) => [c.h, c.l]).concat(emaVals.filter((v) => v > 0), lines.map((l) => l.p));
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const lowEnd = Math.min(...candles.map((c) => c.l)), highEnd = Math.max(...candles.map((c) => c.h));
+  // do not let a far-away EMA200 / level flatten the candles: clamp to ±35% of candle range
+  const span = highEnd - lowEnd || highEnd * 0.01;
+  lo = Math.max(lo, lowEnd - span * 0.35);
+  hi = Math.min(hi, highEnd + span * 0.35);
+  const pad = (hi - lo) * 0.04 || hi * 0.01;
+  lo -= pad;
+  hi += pad;
+  const x = (i) => padL + ((W - padL - padR) * (i + 0.5)) / nC;
+  const y = (p) => padT + ((hi - p) / (hi - lo)) * (H - padT - padB);
+  const bw = Math.max(2, ((W - padL - padR) / nC) * 0.62);
+  const inR = (p) => p >= lo && p <= hi;
+  const emaPath = (arr) => {
+    let d = "", pen = false;
+    (arr || []).forEach((v, i) => {
+      if (typeof v !== "number" || !inR(v)) { pen = false; return; }
+      d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`;
+      pen = true;
+    });
+    return d;
+  };
+  const sorted = [...lines].filter((l) => inR(l.p)).sort((a, b) => y(a.p) - y(b.p));
+  let lastY = -99;
+  sorted.forEach((l) => { let ly = y(l.p); if (ly - lastY < 11) ly = lastY + 11; l.ly = ly; lastY = ly; });
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block", background: C.panelAlt, borderRadius: 8 }} role="img" aria-label="Candlestick chart with EMA lines, support and resistance, divergences and structure shifts">
+      {(chart.zones || []).filter((z) => z.hi >= lo && z.lo <= hi).map((z, i) => (
+        <rect key={"z" + i} x={padL} width={W - padL - padR} y={y(Math.max(z.hi, z.lo + (hi - lo) * 0.002))} height={Math.max(1.5, y(z.lo) - y(Math.max(z.hi, z.lo + (hi - lo) * 0.002)))} fill={C.textDim} opacity={0.15} />
+      ))}
+      {candles.map((c, i) => {
+        const up = c.c >= c.o, col = up ? C.gain : C.loss;
+        return (
+          <g key={c.t} opacity={c.forming ? 0.5 : 1}>
+            <line x1={x(i)} x2={x(i)} y1={y(c.h)} y2={y(c.l)} stroke={col} strokeWidth="1" />
+            <rect x={x(i) - bw / 2} y={y(Math.max(c.o, c.c))} width={bw} height={Math.max(1, Math.abs(y(c.o) - y(c.c)))} fill={c.forming ? "none" : col} stroke={col} strokeWidth="1" strokeDasharray={c.forming ? "2 2" : ""} />
+          </g>
+        );
+      })}
+      <path d={emaPath(chart.ema200)} stroke="#B58CFF" strokeWidth="1.3" fill="none" />
+      <path d={emaPath(chart.ema50)} stroke={C.amber} strokeWidth="1.3" fill="none" />
+      <path d={emaPath(chart.ema20)} stroke={C.blue} strokeWidth="1.3" fill="none" />
+      {(chart.divergences || []).filter((d) => inR(d.p1) && inR(d.p2) && d.i1 >= 0).map((d, i) => (
+        <g key={"dv" + i}>
+          <line x1={x(d.i1)} y1={y(d.p1)} x2={x(d.i2)} y2={y(d.p2)} stroke={d.dir === 1 ? C.gain : C.loss} strokeWidth="2" strokeDasharray={d.kind === "hidden" ? "3 3" : ""} />
+          <circle cx={x(d.i2)} cy={y(d.p2)} r="3.5" fill={d.dir === 1 ? C.gain : C.loss} />
+          <text x={x(d.i2) + 5} y={y(d.p2) + (d.dir === 1 ? 13 : -6)} fontSize="9.5" fill={d.dir === 1 ? C.gain : C.loss} fontFamily={sans}>{d.kind === "hidden" ? "hidden " : ""}{d.dir === 1 ? "bull" : "bear"} div</text>
+        </g>
+      ))}
+      {(chart.shifts || []).filter((s) => s.j >= 0 && inR(s.level)).map((s, i) => (
+        <g key={"sh" + i}>
+          <line x1={x(Math.max(0, s.j - 8))} x2={x(s.j)} y1={y(s.level)} y2={y(s.level)} stroke={C.text} strokeWidth="1" strokeDasharray="2 2" opacity={0.8} />
+          <text x={x(s.j) + 3} y={y(s.level) - 3} fontSize="9.5" fontWeight="700" fill={C.text} fontFamily={sans}>{s.t}</text>
+        </g>
+      ))}
+      {lines.filter((l) => inR(l.p)).map((l) => (
+        <line key={l.label} x1={padL} x2={W - padR} y1={y(l.p)} y2={y(l.p)} stroke={l.c} strokeWidth="1.2" strokeDasharray={l.d} />
+      ))}
+      {sorted.map((l) => (
+        <text key={"t" + l.label} x={W - padR + 4} y={l.ly + 3} fontSize="9.5" fill={l.c} fontFamily={mono}>{l.label} {fmtPrice(l.p)}</text>
+      ))}
+      {isFinite(price) && inR(price) && (
+        <g>
+          <line x1={padL} x2={W - padR} y1={y(price)} y2={y(price)} stroke={C.text} strokeWidth="0.8" strokeDasharray="1 3" opacity={0.7} />
+          <text x={W - padR + 4} y={y(price) - 4} fontSize="9.5" fill={C.text} fontFamily={mono}>Now {fmtPrice(price)}</text>
+        </g>
+      )}
+      <g fontSize="9.5" fontFamily={sans}>
+        <text x={padL + 2} y={H - 9} fill={C.blue}>EMA20</text>
+        <text x={padL + 44} y={H - 9} fill={C.amber}>EMA50</text>
+        <text x={padL + 86} y={H - 9} fill="#B58CFF">EMA200</text>
+        <text x={padL + 136} y={H - 9} fill={C.textDim}>{String(tf).toUpperCase()} · grey bands = S/R · solid = regular divergence, dashed = hidden · dashed candle = still forming</text>
+      </g>
+    </svg>
+  );
+}
+
+function RevSpark({ values, color, w = 120, h = 28 }) {
+  const v = (values || []).filter((q) => typeof q === "number" && isFinite(q));
+  if (v.length < 2) return <span style={{ fontSize: 10.5, color: C.textDim }}>UNAVAILABLE</span>;
+  const lo = Math.min(...v), hi = Math.max(...v), r = hi - lo || 1;
+  const pts = v.map((q, i) => `${((i / (v.length - 1)) * w).toFixed(1)},${(h - 2 - ((q - lo) / r) * (h - 4)).toFixed(1)}`).join(" ");
+  return <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} style={{ display: "block" }}><polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" /></svg>;
+}
+
+function RevPanel({ title, kind, children }) {
+  return (
+    <div style={{ background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, minWidth: 0 }}>
+      <div style={{ fontSize: 10.5, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6 }}>{title}<SrcTag kind={kind} /></div>
+      {children}
+    </div>
+  );
+}
+
+function RevDetail({ r, tf, setTf, onOpen, onLoadDeriv, derivBusy, history, narrow }) {
+  const t = r.byTf[tf];
+  const tfBar = (
+    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+      {REV_TFS.map((q) => {
+        const x = r.byTf[q];
+        const on = q === tf;
+        return (
+          <button key={q} type="button" onClick={() => setTf(q)} style={{ background: on ? C.blue : C.panelAlt, color: on ? "#fff" : C.text, border: `1px solid ${on ? C.blue : C.border}`, borderRadius: 6, padding: "5px 10px", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: sans }}>
+            {q}{x && x.ok ? ` · ${Math.max(x.bull.score, x.bear.score)}` : ""}
+          </button>
+        );
+      })}
+    </div>
+  );
+  if (!t || !t.ok) {
+    return (
+      <div>
+        {tfBar}
+        <div style={{ fontSize: 12.5, color: C.textMuted }}><b>INSUFFICIENT DATA</b> — {t ? t.reason : "no data for this timeframe"}.</div>
+      </div>
+    );
+  }
+  const dm = t.deriv;
+  const missingFlow = !dm.available;
+  const grid = { display: "grid", gridTemplateColumns: narrow ? "1fr 1fr" : "repeat(4, 1fr)", gap: 8, marginBottom: 12 };
+  const sp = t.detections.spikes[0];
+  const sideNow = t.dir;
+  const sup = sideNow === -1 ? t.bear : t.bull;
+  const conf = sup.conflicting || [];
+  const allMissing = [...t.bull.comps, ...t.bear.comps].filter((c) => c.available === false).map((c) => c.name);
+  const missingUniq = [...new Set(allMissing)];
+  const freshCol = t.stale ? C.loss : t.ageMs > 60000 ? C.amber : C.gain;
+  return (
+    <div>
+      {tfBar}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 10 }}>
+        <RevBadge state={t.state} provisional={t.provisional} />
+        {t.dir !== 0 && <span style={{ fontSize: 11.5, color: t.dir === 1 ? C.gain : C.loss, fontWeight: 700 }}>{t.dir === 1 ? "Bullish bias" : "Bearish bias"}</span>}
+        {(t.bull.status.kind || t.bear.status.kind) && (
+          <span style={{ fontSize: 11, color: C.textMuted }}>
+            {t.bull.status.kind ? `Bullish: ${t.bull.status.kind.toUpperCase()}` : ""}{t.bull.status.kind && t.bear.status.kind ? " · " : ""}{t.bear.status.kind ? `Bearish: ${t.bear.status.kind.toUpperCase()}` : ""}
+          </span>
+        )}
+      </div>
+      {t.reasons.length > 0 && <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>{t.reasons.join(" ")}</div>}
+      <div style={{ display: "grid", gridTemplateColumns: narrow ? "1fr" : "1fr 1fr", gap: 14, marginBottom: 12 }}>
+        <div>
+          <ScoreBar label="Bullish reversal score" score={t.bull.score} color={C.gain} max={t.bull.maxPossible} />
+          <ScoreBar label="Bearish reversal score" score={t.bear.score} color={C.loss} max={t.bear.maxPossible} />
+          <div style={{ fontSize: 10.5, color: C.textDim, lineHeight: 1.45 }}>Heuristic ranking from configurable rules — not a probability of success. Unavailable data lowers the maximum possible score instead of being counted as zero evidence.</div>
+        </div>
+        <div style={{ fontSize: 12, lineHeight: 1.7 }}>
+          <div><span style={{ color: C.textDim }}>Timeframe agreement: </span><b style={{ color: C.gain }}>{sup.agreeTfs.length ? sup.agreeTfs.join(", ") : "none"}</b>{sup.conflictTfs.length > 0 && <> · <span style={{ color: C.textDim }}>conflict: </span><b style={{ color: C.loss }}>{sup.conflictTfs.join(", ")}</b></>}</div>
+          <div><span style={{ color: C.textDim }}>Invalidation level: </span><b style={{ fontFamily: mono }}>{t.invalidationLevel ? fmtPrice(t.invalidationLevel) : "— (no directional signal)"}</b><SrcTag kind="DERIVED" /></div>
+          <div><span style={{ color: C.textDim }}>Last closed candle: </span><b>{fmtClock(t.lastClosed)}</b> <span style={{ color: C.textDim }}>(signals use closed candles only)</span></div>
+          <div><span style={{ color: C.textDim }}>Data freshness: </span><b style={{ color: freshCol }}>{t.stale ? "STALE" : "fresh"} · {radarAge(t.ageMs)} behind</b> · <span style={{ color: C.textDim }}>evaluated {fmtClock(r.evaluatedAt)}</span></div>
+          <div><span style={{ color: C.textDim }}>Volume / OI confirmation: </span><b>{sp ? `volume ${sp.rel.toFixed(1)}× avg` : "no volume spike"}</b>{dm.oiChg5 !== null ? <> · OI {fmtPct(dm.oiChg5)} (5 periods)</> : <> · OI <b>UNAVAILABLE</b></>}</div>
+        </div>
+      </div>
+      <RevChart chart={t.chart} price={r.price} invalidation={t.invalidationLevel} tf={tf} />
+
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.04em", margin: "14px 0 6px" }}>Market data panels</div>
+      <div style={grid}>
+        <RevPanel title="Volume (closed candles)" kind="OFFICIAL">
+          <div style={{ fontFamily: mono, fontSize: 14, fontWeight: 700 }}>{sp ? sp.rel.toFixed(1) + "× avg" : "normal"}</div>
+          <div style={{ fontSize: 10.5, color: C.textDim }}>{sp ? `spike ${sp.barsAgo ?? ""} candle(s) ago` : "no spike ≥ " + r.cfg.volSpike + "×"}</div>
+        </RevPanel>
+        <RevPanel title="Taker buy share (kline)" kind="OFFICIAL">
+          <div style={{ fontFamily: mono, fontSize: 14, fontWeight: 700, color: t.detections.takerShare === null ? C.textDim : t.detections.takerShare >= 0.5 ? C.gain : C.loss }}>{t.detections.takerShare === null ? "UNAVAILABLE" : (t.detections.takerShare * 100).toFixed(0) + "%"}</div>
+          <div style={{ fontSize: 10.5, color: C.textDim }}>of recent volume bought at the ask</div>
+        </RevPanel>
+        <RevPanel title="Open interest" kind={dm.oiChg5 !== null ? "DERIVED" : "UNAVAILABLE"}>
+          <div style={{ fontFamily: mono, fontSize: 14, fontWeight: 700 }}>{dm.oiChg5 === null ? "UNAVAILABLE" : fmtPct(dm.oiChg5)}</div>
+          <RevSpark values={dm.oiSeries} color={C.blue} />
+          <div style={{ fontSize: 10.5, color: C.textDim }}>change over 5 {tf} periods{dm.oiChg5 === null ? " — not loaded" : ""}</div>
+        </RevPanel>
+        <RevPanel title="Funding rate" kind={dm.funding !== null ? "OFFICIAL" : "UNAVAILABLE"}>
+          <div style={{ fontFamily: mono, fontSize: 14, fontWeight: 700, color: dm.fundingExtreme ? C.amber : C.text }}>{dm.funding === null ? "UNAVAILABLE" : (dm.funding * 100).toFixed(4) + "%"}</div>
+          <div style={{ fontSize: 10.5, color: C.textDim }}>{dm.fundingChg !== null ? `change vs previous ${(dm.fundingChg * 100).toFixed(4)}%` : "last settlement"}{dm.fundingExtreme ? " · extreme" : ""}</div>
+        </RevPanel>
+        <RevPanel title="Taker buy/sell ratio" kind={dm.takerRatio !== null ? "OFFICIAL" : "UNAVAILABLE"}>
+          <div style={{ fontFamily: mono, fontSize: 14, fontWeight: 700, color: dm.takerRatio === null ? C.textDim : dm.takerRatio >= 1 ? C.gain : C.loss }}>{dm.takerRatio === null ? "UNAVAILABLE" : dm.takerRatio.toFixed(2)}</div>
+          <RevSpark values={dm.takerSeries} color={C.amber} />
+        </RevPanel>
+        <RevPanel title="Global long/short accounts" kind={dm.lsRatio !== null ? "OFFICIAL" : "UNAVAILABLE"}>
+          <div style={{ fontFamily: mono, fontSize: 14, fontWeight: 700 }}>{dm.lsRatio === null ? "UNAVAILABLE" : dm.lsRatio.toFixed(2)}</div>
+          <RevSpark values={dm.lsSeries} color={C.blue} />
+          <div style={{ fontSize: 10.5, color: C.textDim }}>{dm.lsChg5 !== null ? `${fmtPct(dm.lsChg5)} over 5 periods` : ""}</div>
+        </RevPanel>
+        <RevPanel title="Liquidations" kind="UNAVAILABLE">
+          <div style={{ fontSize: 11.5, color: C.textMuted, lineHeight: 1.4 }}>Binance does not publish liquidation history on an open REST endpoint, so it is not used.</div>
+        </RevPanel>
+        <RevPanel title="Momentum" kind="DERIVED">
+          <div style={{ fontFamily: mono, fontSize: 14, fontWeight: 700 }}>RSI {t.rsi === null || t.rsi === undefined ? "—" : t.rsi.toFixed(0)}</div>
+          <div style={{ fontSize: 10.5, color: C.textDim }}>MACD hist {t.macdHist === null || t.macdHist === undefined ? "—" : t.macdHist > 0 ? "positive" : "negative"} · ATR {t.atrPct.toFixed(2)}%</div>
+        </RevPanel>
+      </div>
+      {missingFlow && (
+        <div style={{ fontSize: 11.5, color: C.textMuted, marginBottom: 10 }}>
+          OI / funding / ratios are not loaded for {r.symbol}{dm.errors && dm.errors.length ? ` (${dm.errors.join("; ")})` : ""}.{" "}
+          <button type="button" onClick={onLoadDeriv} disabled={derivBusy} style={{ background: C.panelAlt, color: C.blue, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 9px", fontSize: 11.5, cursor: "pointer" }}>{derivBusy ? "Loading…" : "Load derivatives data"}</button>
+        </div>
+      )}
+
+      <div style={{ background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, marginBottom: 12 }}>
+        <div style={{ fontSize: 10.5, color: C.textDim, textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 4 }}>Large-player activity proxy<SrcTag kind="INFERRED" /></div>
+        <div style={{ fontSize: 14, fontWeight: 800, color: t.flow.label === FLOW.ACCUM || t.flow.label === FLOW.LONGS || t.flow.label === FLOW.COVER ? C.gain : t.flow.label === FLOW.NONE ? C.textMuted : C.loss }}>{t.flow.label}</div>
+        {t.flow.reasons.length > 0 && <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 12, color: C.text, lineHeight: 1.5 }}>{t.flow.reasons.map((x, i) => <li key={i}>{x}</li>)}</ul>}
+        {t.flow.missing.length > 0 && <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 6 }}>UNAVAILABLE inputs: {t.flow.missing.join(", ")}</div>}
+        <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 6, lineHeight: 1.45 }}>{t.flow.note} Positions, average entries and unrealized PnL of any trader are never shown because public data does not contain them.</div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: narrow ? "1fr" : "1fr 1fr", gap: 12, marginBottom: 12 }}>
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.gain, textTransform: "uppercase", marginBottom: 5 }}>✓ Supporting evidence ({sideNow === -1 ? "bearish" : "bullish"})</div>
+          {sup.supporting.length === 0 ? <div style={{ fontSize: 12, color: C.textDim }}>None found.</div> : sup.supporting.map((e, i) => (
+            <div key={i} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>✓ {e.text}<SrcTag kind={e.kind} /></div>
+          ))}
+        </div>
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.loss, textTransform: "uppercase", marginBottom: 5 }}>✗ Conflicting evidence</div>
+          {conf.length === 0 ? <div style={{ fontSize: 12, color: C.textDim }}>None found.</div> : conf.map((e, i) => (
+            <div key={i} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>✗ {e.text}<SrcTag kind={e.kind || "DERIVED"} /></div>
+          ))}
+          {missingUniq.length > 0 && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 6 }}>? Not evaluated (UNAVAILABLE): {missingUniq.join(", ")}</div>}
+        </div>
+      </div>
+
+      <details style={{ marginBottom: 12 }}>
+        <summary style={{ cursor: "pointer", fontSize: 12, color: C.blue }}>How the {sideNow === -1 ? "bearish" : "bullish"} score is built</summary>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ borderCollapse: "collapse", fontSize: 11.5, width: "100%", marginTop: 6 }}>
+            <tbody>
+              {sup.comps.map((c) => (
+                <tr key={c.key} style={{ borderTop: `1px solid ${C.border}` }}>
+                  <td style={{ padding: "4px 6px", whiteSpace: "nowrap" }}>{c.name}</td>
+                  <td style={{ padding: "4px 6px", fontFamily: mono, whiteSpace: "nowrap", color: c.available === false ? C.textDim : C.text }}>{c.available === false ? "n/a" : `${c.points}/${c.max}`}</td>
+                  <td style={{ padding: "4px 6px", color: C.textMuted }}>{c.note}</td>
+                </tr>
+              ))}
+              {sup.penalties.map((p, i) => (
+                <tr key={"p" + i} style={{ borderTop: `1px solid ${C.border}` }}>
+                  <td style={{ padding: "4px 6px", color: C.amber }}>Penalty: {p.name}</td>
+                  <td style={{ padding: "4px 6px", fontFamily: mono, color: C.amber }}>−{p.points}</td>
+                  <td style={{ padding: "4px 6px", color: C.textMuted }}>{p.note}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 4 }}>{sup.status.why}. Thresholds (early ≥ {r.cfg.earlyMin}, confirmed ≥ {r.cfg.confirmMin}, volume spike {r.cfg.volSpike}×, breakout volume {r.cfg.breakVol}×, breakout buffer {r.cfg.breakAtr} ATR) are editable in Settings.</div>
+      </details>
+
+      {history.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 5 }}>Signal history — {r.symbol.replace("USDT", "")}</div>
+          {history.slice(0, 8).map((h) => (
+            <div key={h.id} style={{ fontSize: 11.5, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 3 }}>
+              <span style={{ color: C.textDim, fontFamily: mono }}>{fmtClock(h.at)}</span>
+              <span style={{ fontWeight: 700 }}>{h.tf}</span>
+              <RevBadge state={h.state} />
+              <span style={{ color: C.textDim }}>B{h.bull}/S{h.bear} @ {fmtPrice(h.price)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <button type="button" onClick={() => onOpen(r.symbol, tf)} style={{ background: C.blue, color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", width: narrow ? "100%" : "auto" }}>
+        Open {r.symbol.replace("USDT", "")} {tf} in Analyze →
+      </button>
+    </div>
+  );
+}
+
+function EarlyReversalTab({ rows, funding, logos, openAnalyze }) {
+  const scanner = getRadarScanner();
+  const [cfg, setCfg] = useState(REV_UI_DEFAULTS);
+  const cfgLoaded = useRef(false);
+  const [eligible, setEligible] = useState([]);
+  const [infoState, setInfoState] = useState({ status: "idle", error: null });
+  const [scan, setScan] = useState({ state: "idle", done: 0, total: 0, errors: 0, phase: "", at: null });
+  const [version, setVersion] = useState(0);
+  const [query, setQuery] = useState("");
+  const [tfFilter, setTfFilter] = useState("all");
+  const [dirFilter, setDirFilter] = useState("all");
+  const [stateFilter, setStateFilter] = useState("all");
+  const [sortKey, setSortKey] = useState("priority");
+  const [expanded, setExpanded] = useState(null);
+  const [detailTf, setDetailTf] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [derivBusy, setDerivBusy] = useState(false);
+  const [logVersion, setLogVersion] = useState(0);
+  const [tick, setTick] = useState(0);
+  const [narrow, setNarrow] = useState(typeof window !== "undefined" && window.innerWidth < 820);
+  const runId = useRef(0);
+  const bumpTimer = useRef(null);
+  const logRef = useRef(null);
+  if (!logRef.current) logRef.current = createSignalLog(200);
+  const logLoaded = useRef(false);
+
+  useEffect(() => {
+    const on = () => setNarrow(window.innerWidth < 820);
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, []);
+  useEffect(() => {
+    (async () => {
+      const saved = await safeStorageGet("reversal-settings");
+      if (saved) setCfg((c) => ({ ...c, ...saved }));
+      const hist = await safeStorageGet("reversal-log");
+      if (hist) { logRef.current.load(hist); setLogVersion((v) => v + 1); }
+      cfgLoaded.current = true;
+      logLoaded.current = true;
+    })();
+  }, []);
+  useEffect(() => { if (cfgLoaded.current) safeStorageSet("reversal-settings", cfg); }, [cfg]);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 30000);
+    return () => clearInterval(id);
+  }, []);
+  const set = (k, v) => setCfg((c) => ({ ...c, [k]: v }));
+
+  const tickerBySymbol = useMemo(() => {
+    const m = {};
+    rows.forEach((r) => (m[r.symbol] = r));
+    return m;
+  }, [rows]);
+  const tickerRef = useRef(tickerBySymbol);
+  tickerRef.current = tickerBySymbol;
+  const fundingRef = useRef(funding);
+  fundingRef.current = funding;
+  const rowsAt = useRef(Date.now());
+  useEffect(() => { rowsAt.current = Date.now(); }, [rows]);
+
+  const bump = useCallback(() => {
+    if (bumpTimer.current) return;
+    bumpTimer.current = setTimeout(() => { bumpTimer.current = null; setVersion((v) => v + 1); }, 400);
+  }, []);
+
+  const engineSettings = useMemo(
+    () => ({ volSpike: Number(cfg.volSpike) || REV_DEFAULTS.volSpike, breakVol: Number(cfg.breakVol) || REV_DEFAULTS.breakVol, breakAtr: Number(cfg.breakAtr) || REV_DEFAULTS.breakAtr, earlyMin: Number(cfg.earlyMin) || REV_DEFAULTS.earlyMin, confirmMin: Number(cfg.confirmMin) || REV_DEFAULTS.confirmMin, minQuoteVol: cfg.minVolume > 0 ? cfg.minVolume : REV_DEFAULTS.minQuoteVol }),
+    [cfg.volSpike, cfg.breakVol, cfg.breakAtr, cfg.earlyMin, cfg.confirmMin, cfg.minVolume]
+  );
+
+  const evalSymbol = useCallback(
+    (sym) => {
+      const tk = tickerRef.current[sym];
+      if (!tk || !scanner.hasKlines(sym, REV_TFS)) return null;
+      const g = scanner.getFrames(sym, REV_TFS);
+      const derivByTf = {};
+      REV_TFS.forEach((tf) => { const d = scanner.peekDerivExt(sym, tf); if (d) derivByTf[tf] = d; });
+      const res = evaluateReversal({ symbol: sym, frames: g.frames, live: { ticker: tk }, derivByTf, ages: { ...g.ages, ticker: Date.now() - rowsAt.current }, settings: engineSettings, now: g.at });
+      return res;
+    },
+    [scanner, engineSettings]
+  );
+
+  const runScan = useCallback(
+    async (opts = {}) => {
+      const id = ++runId.current;
+      const cancelled = () => runId.current !== id;
+      const quiet = !!opts.quiet;
+      if (!quiet) setScan({ state: "scanning", done: 0, total: 0, errors: 0, phase: "Loading exchange info", at: null });
+      let list;
+      try {
+        const info = await scanner.loadExchangeInfo();
+        list = info.symbols;
+        setEligible(list);
+        setInfoState({ status: "ready", error: null });
+      } catch (e) {
+        setInfoState({ status: "error", error: e.message || String(e) });
+        setScan((s) => ({ ...s, state: "error", phase: "" }));
+        return;
+      }
+      if (cancelled()) return;
+      const scope = REV_SCOPES.find((s) => s.key === cfg.scope) || REV_SCOPES[0];
+      const tkr = tickerRef.current;
+      const ordered = orderSymbols(list.filter((s) => tkr[s.symbol] && parseFloat(tkr[s.symbol].quoteVolume) >= (cfg.minVolume || 0)), tkr, []).slice(0, scope.n);
+      const r1 = await scanner.scanKlines(ordered, {
+        tfs: REV_TFS,
+        isCancelled: cancelled,
+        onProgress: (p) => !cancelled() && !quiet && setScan((s) => ({ ...s, state: p.state, done: p.done, total: p.total, errors: p.errors, phase: "Scanning candles (5m · 15m · 1h · 4h)" })),
+        onSymbol: bump,
+      });
+      if (cancelled()) return;
+      bump();
+      setScan((s) => ({ ...s, state: "scanning", phase: "Fetching OI / funding / ratios for the strongest candidates" }));
+      const cand = ordered
+        .map((s) => evalSymbol(s.symbol))
+        .filter(Boolean)
+        .map((r) => ({ sym: r.symbol, sc: Math.max(0, ...REV_TFS.map((tf) => (r.byTf[tf] && r.byTf[tf].ok ? Math.max(r.byTf[tf].bull.score, r.byTf[tf].bear.score) : 0))) }))
+        .filter((x) => x.sc >= (cfg.minScore || 0))
+        .sort((a, b) => b.sc - a.sc)
+        .slice(0, 12);
+      for (const c of cand) {
+        for (const tf of REV_DERIV_TFS) {
+          if (cancelled()) return;
+          try { await scanner.getDerivExt(c.sym, tf); } catch (e) { if (e && e.rateLimited) break; }
+        }
+        bump();
+      }
+      if (cancelled()) return;
+      setScan({ state: "done", total: r1.total, done: r1.done, errors: r1.errors, phase: "", at: Date.now() });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [scanner, cfg.scope, cfg.minVolume, cfg.minScore, bump, evalSymbol]
+  );
+
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (!startedRef.current && rows.length > 0) { startedRef.current = true; runScan(); }
+  }, [rows.length, runScan]);
+  useEffect(() => () => { runId.current++; }, []);
+  useEffect(() => {
+    if (!cfg.autoRefresh) return undefined;
+    const id = setInterval(() => { if (scan.state !== "scanning") runScan({ quiet: true }); }, 120000);
+    return () => clearInterval(id);
+  }, [cfg.autoRefresh, scan.state, runScan]);
+
+  // ---- results: re-evaluated cheaply from cached candles ----
+  const results = useMemo(() => {
+    const out = [];
+    eligible.forEach((s) => {
+      const r = evalSymbol(s.symbol);
+      if (r) out.push({ ...r, base: s.base });
+    });
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eligible, version, tick, evalSymbol, rows.length > 0]);
+
+  // ---- signal history: one entry per state change, stored locally ----
+  useEffect(() => {
+    if (!logLoaded.current || results.length === 0) return;
+    let added = false;
+    results.forEach((r) => {
+      REV_TFS.forEach((tf) => {
+        const t = r.byTf[tf];
+        if (!t || !t.ok || t.provisional) return;
+        const e = logRef.current.record({ symbol: r.symbol, tf, state: t.state, dir: t.dir, bull: t.bull.score, bear: t.bear.score, price: r.price, candleTime: t.lastClosed, at: Date.now() });
+        if (e) added = true;
+      });
+    });
+    if (added) { safeStorageSet("reversal-log", logRef.current.entries); setLogVersion((v) => v + 1); }
+  }, [results]);
+
+  // ---- view model ----
+  const q = query.trim();
+  const qNorm = q ? normalizeSymbol(q) : null;
+  const qUpper = q.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const view = useMemo(() => {
+    const rowsV = results
+      .map((r) => {
+        const tf = tfFilter === "all" ? r.bestTf : tfFilter;
+        const t = tf ? r.byTf[tf] : null;
+        return { r, tf, t };
+      })
+      .filter(({ r, t }) => {
+        if (!t) return false;
+        if (qUpper && !r.symbol.includes(qUpper)) return false;
+        if (r.quoteVolume !== null && r.quoteVolume < cfg.minVolume) return false;
+        if (!t.ok) return false;
+        if (stateFilter !== "all" && t.state !== stateFilter) return false;
+        const side = revSide(t.state);
+        if (dirFilter === "bull" && side !== 1) return false;
+        if (dirFilter === "bear" && side !== -1) return false;
+        return Math.max(t.bull.score, t.bear.score) >= cfg.minScore || (t.state !== REV_STATE.NONE && t.state !== REV_STATE.STALE);
+      });
+    const agree = (t) => (t.dir === -1 ? t.bear : t.bull).agreeTfs.length;
+    const val = (x) => {
+      switch (sortKey) {
+        case "bull": return x.t.bull.score;
+        case "bear": return x.t.bear.score;
+        case "agree": return agree(x.t);
+        case "volume": return x.r.quoteVolume || 0;
+        case "change": return Math.abs(x.r.change24h || 0);
+        case "recent": return x.t.lastClosed || 0;
+        case "symbol": return x.r.symbol;
+        default: return revPriority(x.t.state) * 1000 + Math.max(x.t.bull.score, x.t.bear.score);
+      }
+    };
+    rowsV.sort((a, b) => {
+      const va = val(a), vb = val(b);
+      return sortKey === "symbol" ? va.localeCompare(vb) : vb - va;
+    });
+    return rowsV;
+  }, [results, tfFilter, dirFilter, stateFilter, sortKey, qUpper, cfg.minVolume, cfg.minScore]);
+
+  const bullList = view.filter((x) => { const s = revSide(x.t.state); return s === 1 || (s === 0 && x.t.bull.score > x.t.bear.score && x.t.state !== REV_STATE.NONE); });
+  const bearList = view.filter((x) => { const s = revSide(x.t.state); return s === -1 || (s === 0 && x.t.bear.score >= x.t.bull.score && x.t.state !== REV_STATE.NONE); });
+  const quiet = view.filter((x) => x.t.state === REV_STATE.NONE);
+  const counts = useMemo(() => {
+    const m = {};
+    results.forEach((r) => { const t = r.bestTf ? r.byTf[r.bestTf] : null; if (t) m[t.state] = (m[t.state] || 0) + 1; });
+    return m;
+  }, [results]);
+
+  const missingTyped = q && qNorm && !eligible.some((s) => s.symbol === qNorm) && eligible.length > 0;
+  const typedEligible = q && qNorm && eligible.some((s) => s.symbol === qNorm);
+  const typedLoaded = typedEligible && results.some((r) => r.symbol === qNorm);
+
+  const loadOne = async (sym) => {
+    setScan((s) => ({ ...s, phase: `Loading ${sym}` }));
+    try {
+      for (const tf of REV_TFS) await scanner.getKlines(sym, tf);
+    } catch (e) {
+      setScan((s) => ({ ...s, phase: "", errors: s.errors + 1 }));
+    }
+    bump();
+    setScan((s) => ({ ...s, phase: "" }));
+  };
+  const loadDeriv = async (sym) => {
+    setDerivBusy(true);
+    try {
+      for (const tf of REV_TFS) await scanner.getDerivExt(sym, tf);
+    } catch {
+      /* partial data is shown as UNAVAILABLE */
+    }
+    setDerivBusy(false);
+    bump();
+  };
+  const toggle = (r, tf) => {
+    if (expanded === r.symbol) { setExpanded(null); return; }
+    setExpanded(r.symbol);
+    setDetailTf(tf);
+    if (!REV_DERIV_TFS.every((p) => scanner.hasDerivExt(r.symbol, p))) loadDeriv(r.symbol);
+  };
+  const histFor = (sym) => logRef.current.entries.filter((e) => e.symbol === sym);
+  void logVersion;
+
+  const pill = (on) => ({ background: on ? C.blue : C.panelAlt, color: on ? "#fff" : C.text, border: `1px solid ${on ? C.blue : C.border}`, borderRadius: 6, padding: "6px 11px", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: sans });
+
+  const renderCard = (x) => {
+    const { r, tf, t } = x;
+    const open = expanded === r.symbol;
+    const side = revSide(t.state);
+    const accent = side === 1 ? C.gain : side === -1 ? C.loss : C.border;
+    const sup = t.dir === -1 ? t.bear : t.bull;
+    const top = sup.supporting[0];
+    return (
+      <div style={{ background: C.panel, border: `1px solid ${open ? C.blue : C.border}`, borderLeft: `3px solid ${accent}`, borderRadius: 10, padding: 12, marginBottom: 10 }}>
+        <div role="button" tabIndex={0} onClick={() => toggle(r, tf)} onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && toggle(r, tf)} style={{ cursor: "pointer" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+              <CoinIcon symbol={r.symbol} logos={logos} size={22} />
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 800, fontSize: 14 }}>{r.base}<span style={{ color: C.textDim, fontWeight: 500 }}>/USDT</span> <span style={{ fontSize: 10.5, color: C.textMuted, fontWeight: 700 }}>{tf}</span></div>
+                <div style={{ fontSize: 11, color: C.textDim, fontFamily: mono }}>{fmtPrice(r.price)} · <span style={{ color: pctColor(r.change24h) }}>{fmtPct(r.change24h)}</span> · vol {fmtVol(r.quoteVolume)}</div>
+              </div>
+            </div>
+            <div style={{ fontSize: 11, color: C.textDim }}>{open ? "▲" : "▼"}</div>
+          </div>
+          <div style={{ marginBottom: 8 }}><RevBadge state={t.state} provisional={t.provisional} /></div>
+          <ScoreBar label="Bullish" score={t.bull.score} color={C.gain} />
+          <ScoreBar label="Bearish" score={t.bear.score} color={C.loss} />
+          <div style={{ fontSize: 11.5, color: C.textMuted, lineHeight: 1.4 }}>
+            {top ? <>✓ {top.text.length > 120 ? top.text.slice(0, 118) + "…" : top.text}<SrcTag kind={top.kind} /></> : t.reasons[0] || "No supporting evidence yet."}
+          </div>
+          <div style={{ fontSize: 10.5, color: C.textDim, marginTop: 4 }}>
+            agreement: {sup.agreeTfs.length ? sup.agreeTfs.join("+") : "none"}{sup.conflictTfs.length ? ` · conflict ${sup.conflictTfs.join("+")}` : ""} · candle {fmtClock(t.lastClosed)} · {radarAge(t.ageMs)} behind · flow: {t.flow.label}
+          </div>
+        </div>
+        {open && (
+          <div style={{ marginTop: 12, borderTop: `1px solid ${C.border}`, paddingTop: 12 }}>
+            <RevDetail r={r} tf={detailTf || tf} setTf={setDetailTf} onOpen={openAnalyze} onLoadDeriv={() => loadDeriv(r.symbol)} derivBusy={derivBusy} history={histFor(r.symbol)} narrow={narrow} />
+          </div>
+        )}
+      </div>
+    );
+  };
+  const renderList = (title, color, list, empty) => (
+    <div style={{ minWidth: 0 }}>
+      <div style={{ fontSize: 12, fontWeight: 800, color, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>{title} <span style={{ color: C.textDim, fontWeight: 600 }}>({list.length})</span></div>
+      {list.length === 0 ? <div style={{ fontSize: 12, color: C.textDim, padding: "8px 2px 14px" }}>{empty}</div> : list.slice(0, 60).map((x) => <div key={x.r.symbol}>{renderCard(x)}</div>)}
+    </div>
+  );
+
+  const progress = scan.total > 0 ? Math.round((scan.done / scan.total) * 100) : 0;
+  return (
+    <div style={{ maxWidth: 1180, margin: "0 auto" }}>
+      <Card title="Early Reversal & Large-Player Activity" right={<button type="button" onClick={() => runScan()} disabled={scan.state === "scanning"} style={pill(false)}>{scan.state === "scanning" ? "Scanning…" : "Rescan"}</button>}>
+        <div style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.5, marginBottom: 10 }}>
+          Looks for early and confirmed reversals, breakouts and false breakouts on closed candles across 5m · 15m · 1h · 4h, for every eligible Binance USDⓈ-M perpetual. Scores are heuristic rankings, not probabilities. “Accumulation / distribution” labels are <b>inferences from public data</b>, not proof of what any trader holds, and nothing is traded for you.
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 8 }}>
+          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search: BTC, BTCUSDT, btc usdt…" style={{ ...selStyle(), flex: "1 1 180px", minWidth: 0, fontSize: 13, padding: "8px 10px" }} aria-label="Search symbol" />
+          <select value={sortKey} onChange={(e) => setSortKey(e.target.value)} style={selStyle()} aria-label="Sort">
+            {REV_SORTS.map(([k, l]) => <option key={k} value={k}>Sort: {l}</option>)}
+          </select>
+          <button type="button" onClick={() => setShowSettings((v) => !v)} style={pill(showSettings)}>Settings</button>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+          {["all", ...REV_TFS].map((tf) => <button key={tf} type="button" onClick={() => setTfFilter(tf)} style={pill(tfFilter === tf)}>{tf === "all" ? "Best timeframe" : tf}</button>)}
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8, alignItems: "center" }}>
+          {[["all", "All"], ["bull", "Bullish"], ["bear", "Bearish"]].map(([k, l]) => <button key={k} type="button" onClick={() => setDirFilter(k)} style={pill(dirFilter === k)}>{l}</button>)}
+          <select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)} style={{ ...selStyle(), maxWidth: "100%" }} aria-label="State filter">
+            {REV_STATE_FILTERS.map((s) => <option key={s} value={s}>{s === "all" ? "Any state" : s}{s !== "all" && counts[s] ? ` (${counts[s]})` : ""}</option>)}
+          </select>
+        </div>
+        {showSettings && (
+          <div style={{ background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, marginBottom: 8, display: "grid", gridTemplateColumns: narrow ? "1fr 1fr" : "repeat(4, 1fr)", gap: 10 }}>
+            <Field label="Symbols scanned"><select value={cfg.scope} onChange={(e) => set("scope", e.target.value)} style={{ ...selStyle(), width: "100%" }}>{REV_SCOPES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}</select></Field>
+            <Field label="Min 24h volume"><select value={cfg.minVolume} onChange={(e) => set("minVolume", Number(e.target.value))} style={{ ...selStyle(), width: "100%" }}>{RADAR_VOLUMES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select></Field>
+            <Field label="Min score to list"><input type="number" min="0" max="100" value={cfg.minScore} onChange={(e) => set("minScore", Number(e.target.value))} style={{ ...selStyle(), width: "100%" }} /></Field>
+            <Field label="Auto refresh (2 min)"><select value={cfg.autoRefresh ? "on" : "off"} onChange={(e) => set("autoRefresh", e.target.value === "on")} style={{ ...selStyle(), width: "100%" }}><option value="on">On</option><option value="off">Off</option></select></Field>
+            <Field label="Early score ≥"><input type="number" min="10" max="90" value={cfg.earlyMin} onChange={(e) => set("earlyMin", Number(e.target.value))} style={{ ...selStyle(), width: "100%" }} /></Field>
+            <Field label="Confirmed score ≥"><input type="number" min="20" max="95" value={cfg.confirmMin} onChange={(e) => set("confirmMin", Number(e.target.value))} style={{ ...selStyle(), width: "100%" }} /></Field>
+            <Field label="Volume spike (× avg)"><input type="number" step="0.1" min="1" value={cfg.volSpike} onChange={(e) => set("volSpike", Number(e.target.value))} style={{ ...selStyle(), width: "100%" }} /></Field>
+            <Field label="Breakout volume (× avg)"><input type="number" step="0.1" min="1" value={cfg.breakVol} onChange={(e) => set("breakVol", Number(e.target.value))} style={{ ...selStyle(), width: "100%" }} /></Field>
+            <Field label="Breakout buffer (ATR)"><input type="number" step="0.05" min="0" value={cfg.breakAtr} onChange={(e) => set("breakAtr", Number(e.target.value))} style={{ ...selStyle(), width: "100%" }} /></Field>
+            <div style={{ gridColumn: "1 / -1" }}><button type="button" onClick={() => setCfg(REV_UI_DEFAULTS)} style={pill(false)}>Reset to defaults</button></div>
+          </div>
+        )}
+        <div style={{ fontSize: 11.5, color: C.textMuted }}>
+          {infoState.status === "error" && <span style={{ color: C.loss }}>Could not load the Binance symbol list: {infoState.error}. </span>}
+          {scan.state === "scanning" && <>{scan.phase || "Scanning"}{scan.total ? ` — ${scan.done}/${scan.total} (${progress}%)` : ""}. </>}
+          {scan.state === "done" && <>Scanned {scan.done} symbols{scan.errors ? `, ${scan.errors} failed` : ""} · {eligible.length} eligible perpetuals · updated {fmtClock(scan.at)}. </>}
+          {scan.state === "error" && <span style={{ color: C.loss }}>Scan failed. </span>}
+          {scan.state === "scanning" && <div style={{ height: 4, background: C.panelAlt, borderRadius: 2, marginTop: 6 }}><div style={{ width: `${progress}%`, height: "100%", background: C.blue, borderRadius: 2 }} /></div>}
+        </div>
+        {missingTyped && <div style={{ fontSize: 12, color: C.amber, marginTop: 8 }}>{qNorm} is not a currently TRADING USDⓈ-M USDT perpetual on Binance.</div>}
+        {typedEligible && !typedLoaded && (
+          <div style={{ fontSize: 12, color: C.textMuted, marginTop: 8 }}>{qNorm} is eligible but outside the scanned set. <button type="button" onClick={() => loadOne(qNorm)} style={{ ...pill(false), padding: "3px 9px" }}>Analyze {qNorm}</button></div>
+        )}
+      </Card>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+        {[REV_STATE.BULL_CONF, REV_STATE.EARLY_BULL, REV_STATE.BEAR_CONF, REV_STATE.EARLY_BEAR, REV_STATE.BREAKOUT, REV_STATE.BREAKDOWN, REV_STATE.POT_BREAKOUT, REV_STATE.POT_BREAKDOWN, REV_STATE.FALSE_RISK].map((s) => (
+          <button key={s} type="button" onClick={() => setStateFilter(stateFilter === s ? "all" : s)} style={{ ...revStateStyle(s), background: stateFilter === s ? revStateStyle(s).bg : C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: "4px 8px", fontSize: 10.5, fontWeight: 700, cursor: "pointer" }}>
+            {s} · {counts[s] || 0}
+          </button>
+        ))}
+      </div>
+
+      {scan.state !== "scanning" && results.length === 0 && infoState.status !== "error" && (
+        <Card><div style={{ fontSize: 13, color: C.textMuted }}>{rows.length === 0 ? "Waiting for Binance market data…" : "No symbols analysed yet."}</div></Card>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: narrow ? "1fr" : "1fr 1fr", gap: 16, alignItems: "start" }}>
+        {renderList("Bullish — reversal / breakout", C.gain, bullList, "No bullish signals match the filters. A quiet market is a valid result.")}
+        {renderList("Bearish — reversal / breakdown", C.loss, bearList, "No bearish signals match the filters. A quiet market is a valid result.")}
+      </div>
+      {quiet.length > 0 && <div style={{ fontSize: 11.5, color: C.textDim, margin: "6px 0 14px" }}>{quiet.length} scanned symbols show NO CLEAR SIGNAL and are hidden from the lists. Choose “NO CLEAR SIGNAL” in the state filter to see them.</div>}
+
+      <Card title={`Signal history (${logRef.current.entries.length})`} right={<div style={{ display: "flex", gap: 6 }}><button type="button" onClick={() => setShowHistory((v) => !v)} style={pill(false)}>{showHistory ? "Hide" : "Show"}</button>{showHistory && <button type="button" onClick={() => { logRef.current.clear(); safeStorageSet("reversal-log", []); setLogVersion((v) => v + 1); }} style={pill(false)}>Clear</button>}</div>}>
+        {!showHistory ? <div style={{ fontSize: 12, color: C.textDim }}>Each time a symbol's state changes on a timeframe it is logged here, stored only in this browser.</div> : logRef.current.entries.length === 0 ? <div style={{ fontSize: 12, color: C.textDim }}>No signals recorded yet.</div> : (
+          <div>
+            {logRef.current.entries.slice(0, 60).map((h) => (
+              <div key={h.id} role="button" tabIndex={0} onClick={() => openAnalyze(h.symbol, h.tf)} style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", fontSize: 12, padding: "5px 0", borderTop: `1px solid ${C.border}`, cursor: "pointer" }}>
+                <span style={{ fontFamily: mono, color: C.textDim, minWidth: 108 }}>{fmtClock(h.at)}</span>
+                <b>{h.symbol.replace("USDT", "")}</b><span style={{ color: C.textMuted }}>{h.tf}</span>
+                <RevBadge state={h.state} />
+                <span style={{ color: C.textDim, fontFamily: mono }}>B{h.bull}/S{h.bear} @ {fmtPrice(h.price)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+      <div style={{ fontSize: 10.5, color: C.textDim, lineHeight: 1.5, padding: "0 4px 20px" }}>
+        Data: Binance USDⓈ-M public market-data endpoints only (klines, 24h ticker, exchangeInfo, open-interest history, long/short ratios, taker ratio, funding). No API keys. Source tags: <SrcTag kind="OFFICIAL" /> read directly · <SrcTag kind="DERIVED" /> calculated from official data · <SrcTag kind="INFERRED" /> an interpretation · <SrcTag kind="UNAVAILABLE" /> not provided, never replaced by zero.
+      </div>
+    </div>
+  );
+}
+
 function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrades, setSavedTrades, logos, goToTrades, prefill }) {
   const [section, setSection] = useState("setup"); // setup | deep | smart
   const [justTracked, setJustTracked] = useState(null); // symbol just added to Trades
@@ -4518,7 +5260,7 @@ function AnalyzeTab({ rows, funding, analyzeSymbol, setAnalyzeSymbol, savedTrade
         ))}
       </div>
 
-      {section === "deep" && <DeepAnalysis rows={rows} funding={funding} logos={logos} />}
+      {section === "deep" && <DeepAnalysis rows={rows} funding={funding} logos={logos} prefill={prefill} />}
 
       {section === "smart" && (
         <SmartEntryPanel
@@ -5453,7 +6195,7 @@ function AnalysisReport({ an, result, showHelp, setShowHelp }) {
   );
 }
 
-function DeepAnalysis({ rows, funding, logos }) {
+function DeepAnalysis({ rows, funding, logos, prefill }) {
   const [symbolText, setSymbolText] = useState("");
   const [intervalKey, setIntervalKey] = useState("1h");
   const [customAmount, setCustomAmount] = useState("");
@@ -5600,6 +6342,23 @@ function DeepAnalysis({ rows, funding, logos }) {
   const sectionStyle = { paddingBottom: 14, marginBottom: 14, borderBottom: `1px solid ${C.border}` };
   const grid = { display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 14, columnGap: 10 };
   const inputStyle = { ...selStyle(), padding: "10px 12px", width: "100%", boxSizing: "border-box", fontSize: 13 };
+
+  // opened from Early Reversal: pick the symbol + timeframe, then run once the row is matched
+  const [autoRun, setAutoRun] = useState(null);
+  useEffect(() => {
+    if (!prefill || !prefill.symbol || prefill.section !== "deep" || Date.now() - prefill.n > 15000) return;
+    setSymbolText(prefill.symbol.replace(/USDT$/, ""));
+    if (prefill.tf && DEEP_INTERVALS.includes(prefill.tf)) setIntervalKey(prefill.tf);
+    setAutoRun(prefill.n);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill?.n]);
+  useEffect(() => {
+    if (!autoRun || !matchedRow || !prefill || matchedRow.symbol !== prefill.symbol) return;
+    if (prefill.tf && intervalKey !== prefill.tf) return;
+    setAutoRun(null);
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRun, matchedRow, intervalKey]);
 
   return (
     <>
