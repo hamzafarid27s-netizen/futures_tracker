@@ -5777,6 +5777,12 @@ function planKlines(intervalKey, customAmount, customUnit) {
 
 // Downloads the most recent n candles, paging backwards (Binance returns at
 // most 1500 per request).
+// Rejects if a request never answers, so a screen cannot sit on "Analysing…" forever.
+function withTimeout(promise, ms, message) {
+  let t;
+  const timer = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(message)), ms); });
+  return Promise.race([promise, timer]).finally(() => clearTimeout(t));
+}
 async function fetchKlinesN(symbol, interval, n) {
   const out = [];
   let endTime = null;
@@ -6260,7 +6266,7 @@ function DeepAnalysis({ rows, funding, logos, prefill }) {
     setResult(null);
     setAthState({ status: "idle", data: null });
     try {
-      const baseCandles = await fetchKlinesN(symbol, plan.base, (n + warmN) * plan.ratio);
+      const baseCandles = await withTimeout(fetchKlinesN(symbol, plan.base, (n + warmN) * plan.ratio), 45000, "Binance did not answer in time (it may be rate-limiting). Try again in a minute.");
       const candles = aggregateCandles(baseCandles, plan.ratio);
       if (candles.length < 2) throw new Error("Binance has too little history for this pair at that interval.");
       const win = candles.slice(-n);
@@ -6289,9 +6295,9 @@ function DeepAnalysis({ rows, funding, logos, prefill }) {
       };
 
       const [extrasS, posS, fundS] = await Promise.allSettled([
-        fetchAnalysisExtras(symbol),
-        fetchPositioning(symbol, durationMs),
-        getFundingIntervalHours(symbol),
+        withTimeout(fetchAnalysisExtras(symbol), 20000, "extras timed out"),
+        withTimeout(fetchPositioning(symbol, durationMs), 20000, "positioning timed out"),
+        withTimeout(getFundingIntervalHours(symbol), 20000, "funding interval timed out"),
       ]);
       if (id !== runId.current) return;
       stats.oi = extrasS.status === "fulfilled" ? extrasS.value?.multiExchange?.binance?.oi ?? null : null;
