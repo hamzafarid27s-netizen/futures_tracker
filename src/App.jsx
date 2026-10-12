@@ -4011,9 +4011,6 @@ function SmartEntryPanel({ rows, funding, logos, symbolText, setSymbolText }) {
 
   return (
     <div>
-      <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 14, lineHeight: 1.5 }}>
-        Smart Entry Zone shows where a LONG or SHORT could be planned, built from real Binance candles: confluence zones, a completed-candle trigger, invalidation, stop and targets. It is a planning aid — never a promise of a perfect entry or profit, and nothing is traded for you.
-      </div>
 
       <Card title="Pair">
         <SymbolPicker rows={rows} logos={logos} value={symbolText} onChange={setSymbolText} onSelect={(s) => setSymbolText(s.replace("USDT", ""))} placeholder="Pair, e.g. BTC — tap to browse" />
